@@ -1,0 +1,152 @@
+[build-system]
+# >=77 for the PEP 639 SPDX `license` string + `license-files` below.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vodparse"
+version = "0.9.0"
+description = "YOLO + EasyOCR pipeline for analyzing tournament match VODs (logo, timer, and portrait detection)."
+readme = "README.md"
+# PEP 639 SPDX expression ("or later" per the NOTICE grant). License *classifiers* are
+# deprecated in favor of this field, so none appears in `classifiers` below.
+license = "AGPL-3.0-or-later"
+# Named rather than globbed as "licenses/*": that directory is also where the build scripts
+# write the generated THIRD-PARTY-LICENSES.txt (~2 MB) and FFMPEG-BUILD-CONFIG.txt, which
+# describe one frozen build and have no business inside a wheel's dist-info.
+license-files = ["LICENSE", "NOTICE", "licenses/torchvision-LICENSE.txt"]
+# Name-only by design: the project is published pseudonymously with no contact email;
+# security reports go through GitHub's private vulnerability-reporting form.
+authors = [{ name = "Sandfall" }]
+keywords = ["ssbu", "vod", "video-analysis", "ocr", "yolo", "clip-export"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+# 3.12+ required: the code uses PEP 604 unions (`dict | None`) in function signatures,
+# which are evaluated at import time, along with 3.12-only typing idioms (e.g.
+# `typing.NotRequired` / `@override` and PEP 695 generics).
+requires-python = ">=3.12"
+dependencies = [
+    "ultralytics",
+    "easyocr",
+    # The docTR (PARSeq) overlay text engine: the GUI's "Text engine" choice / the
+    # pipeline's --ocr-engine doctr (see vodparse.ocr_engine). docTR 1.0 dropped its
+    # TensorFlow backend, so it runs on the same PyTorch stack as everything above.
+    "python-doctr>=1.0",
+    "opencv-python",
+    "pillow",
+    "numpy",
+    "torch",
+    "torchvision",
+    # Runtime dep: vodparse.export imports `ffmpeg` (ffmpeg-python) at module load, so it is
+    # needed by the core package and the GUI, not just the dev tooling. ffmpeg-python only
+    # *builds and runs* commands; it does not provide the `ffmpeg` executable itself.
+    "ffmpeg-python",
+    # Provides the actual `ffmpeg` *binary* (a static build shipped as a wheel). vodparse.export
+    # falls back to it when no system ffmpeg is on PATH, so plain pip/uv installs are
+    # self-contained. A system/Homebrew ffmpeg still wins if present.
+    "imageio-ffmpeg",
+    # Runtime dep: vodparse.debug builds DataFrames for timer segment grouping (imported lazily
+    # in segments_dataframe). ultralytics no longer pulls it in transitively, so declare it.
+    "pandas",
+]
+
+# Dev-only tooling (data generation, training, asset prep, type checking, linting).
+# Not bundled into the distributed executable. Install with: pip install -e ".[dev]"
+[project.optional-dependencies]
+dev = [
+    "rembg",
+    "mypy",
+    "ruff",
+]
+
+# Desktop GUI for running the pipeline + match extraction. Install with:
+# pip install -e ".[gui]"
+gui = [
+    "PyQt6",
+]
+
+# Test-runner extra, for working on the project. Install with: pip install -e ".[test]"
+test = [
+    "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/Sandfall/ultimate-vod-studio"
+Repository = "https://github.com/Sandfall/ultimate-vod-studio"
+Issues = "https://github.com/Sandfall/ultimate-vod-studio/issues"
+Releases = "https://github.com/Sandfall/ultimate-vod-studio/releases"
+
+# Console entry point for the desktop GUI. After install, `ultimate-vod-studio`
+# launches the app (needs the gui extra: PyQt6: vodparse.gui.launch turns a missing
+# extra into an actionable message instead of a raw import traceback).
+[project.scripts]
+ultimate-vod-studio = "vodparse.gui.launch:main"
+vodparse-pipeline = "vodparse.cli.pipeline:main"
+vodparse-extract = "vodparse.cli.extract_matches:main"
+vodparse-export = "vodparse.cli.export_reviewed:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Ship the PEP 561 marker so installed copies expose the schema.py types to checkers.
+[tool.setuptools.package-data]
+vodparse = ["py.typed"]
+
+# Schema enforcement: plain `mypy` (no arguments) checks the package, the CLI entry points,
+# the desktop GUI, and the test suite against src/vodparse/schema.py. mypy_path makes the
+# explicit paths and the `import vodparse` resolution agree on module identity: without it,
+# the editable install's import path makes mypy see two copies of every module and the
+# TypedDicts stop matching. Keep this clean when changing any data shape. The
+# GUI files need PyQt6 installed (pip install -e ".[gui]") for mypy to resolve imports.
+[tool.mypy]
+files = ["src/vodparse"]
+mypy_path = "src"
+ignore_missing_imports = true
+# The code uses 3.12 syntax (PEP 695 generics like `def nn[T](...)`); pinning the target
+# keeps the check result identical regardless of which interpreter runs mypy.
+python_version = "3.12"
+
+# Test-runner defaults, for working on the project. Tests marked "slow" (the FrameReader
+# video stress test) are skipped by default; run them with `pytest -m slow` (or
+# everything with `pytest -m ""`).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: decodes/encodes real video; excluded from the default run (pytest -m slow)",
+]
+
+# Lint with `ruff check`. Deliberately high-signal: pyflakes (F: unused imports/names, broken
+# f-strings, undefined names) + bugbear (B: real bug patterns like mutable defaults). The
+# pycodestyle style families (E4 import placement, E7 one-line statements) are intentionally NOT
+# enabled: the terse tool scripts use semicolons and the GUI orders imports after a plugin-init
+# call on purpose. Non-source trees are excluded so lint covers only code we maintain.
+[tool.ruff]
+target-version = "py312"
+extend-exclude = [".buildenv", "other", "runs", "vendor", "json_output", "tool_workspace"]
+# PLW1514 (encoding=) is still a preview-only rule in this ruff version, so preview mode must
+# be on; explicit-preview-rules below confines it to rules named in `select`, keeping F/B on
+# their stable behavior even across ruff upgrades.
+preview = true
+
+[tool.ruff.lint]
+explicit-preview-rules = true
+select = ["F", "B", "PLW1514"]
+# B905 (zip without strict=) is intentionally off: adding strict= to every call is churn and
+# changes runtime behavior; the zips here pair known-equal-length sequences.
+ignore = ["B905"]
+
+[tool.ruff.lint.per-file-ignores]
+# Dev-only data/training/asset-prep scripts (tools/data_prep, tools/timer, etc.) open dozens
+# of scratch files with the platform default encoding; none of them touch user-facing text and
+# churning them all for PLW1514 isn't worth it. src/ still enforces it.
+"tools/**" = ["PLW1514"]

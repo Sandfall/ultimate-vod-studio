@@ -1,0 +1,123 @@
+name: Build macOS (dev)
+
+# Builds the macOS app bundle (Ultimate VOD Studio) on a hosted Apple-silicon runner, since
+# PyInstaller can't cross-compile. This file is the build itself — build_mac.sh end to end,
+# plus the bundle gates below — shared by both ways a build happens:
+#   - by hand from the Actions tab ("Run workflow"): a test build, whose zip stays a
+#     short-lived workflow artifact and never reaches users
+#   - called by build-mac.yml on a version tag, which then attests the zip and attaches it
+#     to the tag's GitHub Release
+# NOT on every push: macOS runners bill at 10x while the repo is private. A locally-run
+# ./build_mac.sh stays the way to smoke-test on a real Mac; what ships to users is what
+# this workflow builds.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"   # matches the Windows build + local dev
+          cache: pip
+
+      # The whole build lives in build_mac.sh so CI and a local Mac build run the exact
+      # same steps: build venv, deps, staged ffmpeg + OCR weights (with the script's own
+      # hard fail if those come up short), license collection, model weights, PyInstaller.
+      # The token lets the weights step authenticate if it has to fetch from a GitHub
+      # Release that is still private (pre-publication test builds); it's unused otherwise.
+      - name: Build (build_mac.sh)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./build_mac.sh
+
+      # Guard against a silent weight-less build, mirroring the Windows workflow's checks:
+      # UltimateVODStudio.spec skips-with-warning (not error) on missing weights, so only a
+      # post-freeze check proves the bundle is complete. PyInstaller writes the same payload
+      # twice — dist/UltimateVODStudio/ (plain folder, data files under _internal/) and
+      # "dist/Ultimate VOD Studio.app" — so the checks read the folder and the zip below
+      # ships the .app.
+      - name: Verify bundled weights
+        run: |
+          set -euo pipefail
+          internal=dist/UltimateVODStudio/_internal
+          pts=$(find "$internal/weights" -maxdepth 1 -name '*.pt' | wc -l | tr -d ' ')
+          if [ "$pts" -ne 3 ]; then
+              echo "expected 3 bundled weights (timer/character/m_char), found $pts" >&2
+              exit 1
+          fi
+          # The docTR text-engine models (spec destination doctr_models/models/): detector
+          # + recognizer.
+          doctr=$(find "$internal/doctr_models/models" -maxdepth 1 -name '*.pt' | wc -l | tr -d ' ')
+          if [ "$doctr" -lt 2 ]; then
+              echo "expected the bundled docTR models (DBNet + PARSeq), found $doctr" >&2
+              exit 1
+          fi
+          # And the EasyOCR weights (spec destination easyocr_models/model/): Reader(['en'])
+          # needs the CRAFT detector plus the English recognizer.
+          easyocr=$(find "$internal/easyocr_models/model" -maxdepth 1 -name '*.pth' | wc -l | tr -d ' ')
+          if [ "$easyocr" -lt 2 ]; then
+              echo "expected the bundled EasyOCR weights (CRAFT detector + English recognizer), found $easyocr" >&2
+              exit 1
+          fi
+
+      # Compliance gate, mirroring the Windows workflow. The app bundles GPL-3.0 (PyQt6)
+      # and LGPL (Qt 6, python-bidi, OpenCV's video backend) components, all of which
+      # require their license text to accompany the binary. The spec only warns when a
+      # licensing file is missing so a dev freeze still runs, which is exactly why CI has
+      # to be the thing that refuses to ship without it.
+      - name: Verify bundled license texts
+        run: |
+          set -euo pipefail
+          internal=dist/UltimateVODStudio/_internal
+          for f in LICENSE NOTICE licenses/THIRD-PARTY-LICENSES.txt licenses/FFMPEG-BUILD-CONFIG.txt; do
+              if [ ! -f "$internal/$f" ]; then
+                  echo "$f is missing from the bundle; the app must ship its own license texts" >&2
+                  exit 1
+              fi
+          done
+          # Assert the copyleft texts specifically, not a file count: a document that
+          # resolved but collected nothing would still pass a size check.
+          doc="$internal/licenses/THIRD-PARTY-LICENSES.txt"
+          for needle in 'GNU GENERAL PUBLIC LICENSE' 'GNU LESSER GENERAL PUBLIC LICENSE' 'GNU AFFERO GENERAL PUBLIC LICENSE'; do
+              if ! grep -qF "$needle" "$doc"; then
+                  echo "'$needle' is absent from THIRD-PARTY-LICENSES.txt; the copyleft dependencies (PyQt6, Qt 6, Ultralytics) did not make it in" >&2
+                  exit 1
+              fi
+          done
+          # ...and each copyleft distribution gets its own section, because the three
+          # license bodies above are not attributable on their own: python-bidi's LGPL text
+          # alone would satisfy the LGPL needle with Qt 6 missing entirely. Section headers
+          # are written as "<name> <version>" at the start of a line by render_document().
+          for dist in PyQt6 PyQt6-Qt6 python-bidi ultralytics; do
+              if ! grep -qE "^$dist [^ ]" "$doc"; then
+                  echo "THIRD-PARTY-LICENSES.txt has no section for $dist; its license text did not make it into the bundle" >&2
+                  exit 1
+              fi
+          done
+
+      # Zip the .app with ditto, which preserves the symlinks, executable bits, and extended
+      # attributes a bare zip tool can drop — an .app missing those won't launch. Zipping
+      # here, in the build, means every consumer gets the same bytes: on a release,
+      # build-mac.yml signs a provenance record for this exact file and attaches it to the
+      # GitHub Release.
+      - name: Zip the app
+        run: ditto -c -k --keepParent "dist/Ultimate VOD Studio.app" UltimateVODStudio-macos.zip
+
+      # The downloadable result of a manual test build, and the hand-off to build-mac.yml's
+      # publish job on a release build. (Artifact downloads from the Actions UI arrive as a
+      # zip wrapping this zip — an artifact-storage quirk, harmless for a test build.)
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: UltimateVODStudio-macos
+          path: UltimateVODStudio-macos.zip
+          retention-days: 3        # builds are ~1GB; keep storage small
+          if-no-files-found: error

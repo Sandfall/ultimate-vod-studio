@@ -1,0 +1,251 @@
+Ultimate VOD Studio
+Copyright (C) 2026 Sandfall
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program (see the LICENSE file). If not, see
+<https://www.gnu.org/licenses/>.
+
+
+================================================================================
+Trademark and intellectual-property disclaimer
+================================================================================
+
+This is an unofficial, non-commercial fan and research project. It is NOT
+affiliated with, endorsed by, sponsored by, or approved by the publisher or
+rights holder of any game it works with.
+
+This statement describes the project itself; it does not restrict what you do
+with the software, your own footage, or the clips you export.
+
+Game titles, character names, and other game-related terms are trademarks of
+their respective owners. They appear in this project as text only — class
+labels in the source code, words in the documentation — to identify each game
+and its characters for analysis of gameplay footage you provide.
+
+No game assets ship with this project: no character portraits, images, artwork,
+logos, audio, or other publisher content.
+
+
+================================================================================
+Bundled model weights
+================================================================================
+
+The trained model weights distributed alongside this project (as release
+assets, not in the source tree) are AGPL-3.0, as part of this combined work.
+
+  - The timer and character detectors are YOLOv8 models fine-tuned from
+    Ultralytics' COCO-pretrained checkpoints, which are AGPL-3.0; the derived
+    weights are therefore AGPL-3.0 too.
+  - The m_char classifier is a ResNet-18 fine-tuned from torchvision's ImageNet
+    weights (BSD-3-Clause), redistributed under AGPL-3.0 as part of this
+    combined work. torchvision's copyright notice is retained in
+    licenses/torchvision-LICENSE.txt.
+
+
+================================================================================
+Third-party components
+================================================================================
+
+This project depends on a lot of open-source software at runtime, each piece
+used under its own license. The full license text of every bundled dependency
+ships with the application in one generated document:
+
+    licenses/THIRD-PARTY-LICENSES.txt
+
+It is written from the installed wheels at build time by
+tools/licensing/license_report.py, and is reachable in the app from
+Help ▸ About ▸ Licenses. From a checkout:
+
+    python tools/licensing/license_report.py bundle   # write the shipped document
+    python tools/licensing/license_report.py report   # print name -> license, to audit
+
+The dependencies whose licenses constrain how this project may be distributed:
+
+  Ultralytics (YOLOv8) .............. AGPL-3.0
+  ultralytics-thop .................. AGPL-3.0
+  PyQt6 ............................. GPL-3.0-only
+  Qt 6 (PyQt6-Qt6) .................. LGPL-3.0
+  python-bidi ....................... LGPL-3.0
+  OpenCV's FFmpeg video backend ..... LGPL-2.1 (see the FFmpeg section below)
+  The bundled FFmpeg binaries ....... GPL (see the FFmpeg section below)
+  certifi, tqdm ..................... MPL-2.0
+
+The two AGPL-3.0 dependencies are why this project is itself AGPL-3.0. PyQt6
+(GPL-3.0-only) and Qt 6 (LGPL-3.0) are both compatible with that (GPL-3.0
+section 13 permits combining with an AGPL-3.0 work, and AGPL-3.0 section 13
+the reverse). The LGPL components (Qt 6, python-bidi, OpenCV's FFmpeg backend)
+ship as dynamically linked libraries, which satisfies the LGPL's relinking
+requirement. certifi and tqdm are MPL-2.0, weak copyleft: distributing a binary
+means saying where their source is (section 3.2), and the pointers under
+"Corresponding source" below do that. Everything else in the dependency closure
+is permissive (MIT, BSD, Apache-2.0, PSF and similar); their copyright notices
+travel in the bundled document.
+
+One more component ships in the packaged application without being a Python
+dependency: PyInstaller's bootloader, the small C program that becomes the
+executable's entry point. It is GPL-2.0-or-later with the bootloader exception,
+which expressly permits linking it into an application under any license;
+source at https://github.com/pyinstaller/pyinstaller. As a build tool rather
+than an installed package it is absent from the generated document.
+
+
+================================================================================
+Bundled FFmpeg binaries
+================================================================================
+
+The packaged application bundles FFmpeg so end users need nothing installed.
+The ffmpeg executable is invoked as a separate process (via ffmpeg-python
+building a command line), never linked into this program; the shared libraries
+are used by OpenCV and Qt for decoding. Several distinct FFmpeg builds ship,
+and they differ by platform. Every one arrives from a published wheel or
+release rather than from the build machine, and none carries --enable-nonfree
+(the build refuses to proceed past one that does), so every copy is freely
+redistributable.
+
+The configure flags actually read out of these binaries at build time are
+recorded in licenses/FFMPEG-BUILD-CONFIG.txt, which ships beside this file.
+Where that document and this one disagree, that document describes the artifact
+you have; the notes below describe the wheels this project builds against. Of
+those, only opencv-python is version-pinned by build_mac.sh /
+build_windows.ps1 — it is the one whose vendored FFmpeg has differed in LICENSE
+and not merely in version between releases (see 4).
+
+  1. bin/ffmpeg(.exe) - the executable this program actually calls, staged from
+     the imageio-ffmpeg package by the build scripts.
+       Windows (v7.1) / Linux (v7.0.2): --enable-gpl --enable-version3
+       -> GPL-3.0.
+       macOS (v7.1): --enable-gpl without --enable-version3 -> GPL-2.0-or-later
+       (that build omits the Apache-licensed AMR codecs which force version3 on
+       the other two). FFmpeg is licensed "version 2 or later", so this copy is
+       likewise usable under GPL-3.0.
+
+  2. imageio_ffmpeg/binaries/ffmpeg-* - the same upstream build as (1), carried
+     inside the imageio-ffmpeg package (the build scripts copy that very file
+     to bin/). Byte-identical on Windows; on macOS the two copies differ only
+     in the ad-hoc code signature PyInstaller applies. Same license as (1) on
+     each platform.
+
+  3. Qt's multimedia backend (avcodec, avformat, avutil, swscale, swresample),
+     used by the in-app video preview. Qt builds its own FFmpeg (n7.1.3) on
+     both platforms, without --enable-gpl, so these copies are LGPL. They are
+     distinct from the OpenCV libraries in (4) despite the overlapping soname.
+
+  4. OpenCV's video I/O backend.
+       Windows and Linux: OpenCV's own builds, no --enable-gpl -> LGPL-2.1,
+       whose text opencv-python ships in its LICENSE-3RD-PARTY.txt.
+       macOS: opencv-python's macOS wheels instead vendor a Homebrew-built
+       FFmpeg 7.1.1 configured --enable-gpl --enable-version3 -> GPL-3.0. That
+       is a property of the published wheel, not of the build machine: the same
+       libraries, byte for byte, are inside
+       opencv_python-4.13.0.92-cp37-abi3-macosx_13_0_arm64.whl as downloaded
+       from PyPI. This is why the build scripts pin opencv-python: an upstream
+       wheel carrying a differently configured FFmpeg would otherwise silently
+       change the licensing of what ships.
+
+In a source checkout no FFmpeg is bundled: the binary is located at runtime as
+an `ffmpeg` already on PATH (e.g. a system or Homebrew install), otherwise the
+static build provided by the imageio-ffmpeg dependency.
+
+
+================================================================================
+Corresponding source
+================================================================================
+
+The GPL, LGPL, AGPL and MPL components above oblige whoever distributes this
+application to make their source available to the people who receive it. This
+section is that offer.
+
+None of these components has been modified. Every one is redistributed exactly
+as its authors published it: the Python packages as their PyPI wheels, FFmpeg
+as the builds carried inside those wheels. So the corresponding source is
+upstream's own, unchanged, and no patches travel with this application. (Anyone
+who forks this project and DOES patch one of them takes on the obligation to
+publish that modified source themselves; see GPL-3.0 section 5.)
+
+Where to get it:
+
+  Ultimate VOD Studio itself ... https://github.com/Sandfall/ultimate-vod-studio
+                                 (AGPL-3.0; the tag matching this build's version)
+  FFmpeg ....................... https://ffmpeg.org/releases/
+                                 x264, x265, xvid and the other GPL components
+                                 enabled in these builds are linked from
+                                 https://ffmpeg.org/download.html
+                                 Homebrew's recipe for the build opencv-python's
+                                 macOS wheels carry:
+                                 https://github.com/Homebrew/homebrew-core
+  PyQt6 ........................ https://pypi.org/project/PyQt6/#files
+  Qt 6 (PyQt6-Qt6) ............. NOT from PyPI: the PyQt6-Qt6 package publishes
+                                 wheels only, and they contain Qt's binaries rather
+                                 than its source. Qt 6's source, from which those
+                                 binaries are built, is published by The Qt Company
+                                 at https://download.qt.io/archive/qt/ (the 6.x
+                                 series matching the version recorded in
+                                 licenses/THIRD-PARTY-LICENSES.txt), with the
+                                 development history at https://code.qt.io/
+  Ultralytics, ultralytics-thop  https://pypi.org/project/ultralytics/#files and
+                                 https://pypi.org/project/ultralytics-thop/#files
+  python-bidi .................. https://pypi.org/project/python-bidi/#files
+  opencv-python ................ https://pypi.org/project/opencv-python/#files
+  certifi, tqdm (MPL-2.0) ...... https://pypi.org/project/certifi/#files and
+                                 https://pypi.org/project/tqdm/#files
+  Any other dependency ......... https://pypi.org/project/<name>/#files
+
+Which VERSION to ask for is recorded in licenses/THIRD-PARTY-LICENSES.txt,
+which lists the exact version of every package this build was assembled from;
+the FFmpeg builds' versions and configure flags are in
+licenses/FFMPEG-BUILD-CONFIG.txt beside it. GPL-3.0 section 6(d) permits this
+offer to point at servers operated by someone else, which is what the links
+above do; they are repeated wherever the built application is published.
+
+If any link above has gone dead, open an issue on the project page and it will
+be corrected.
+
+
+================================================================================
+Bundled third-party model weights
+================================================================================
+
+Separately from this project's own weights (documented above), the packaged
+application bundles pretrained text-recognition models so it runs offline:
+
+  craft_mlt_25k.pth (text detection) ........ ~80 MB, distributed by JaidedAI/EasyOCR
+  english_g2.pth (text recognition) ......... ~14 MB, distributed by JaidedAI/EasyOCR
+  docTR DBNet + PARSeq weights .............. ~190 MB, from mindee/doctr
+
+EasyOCR itself is Apache-2.0 and publishes both of its weights from its own
+releases. The detection weights are CRAFT, from NAVER Corp's
+clovaai/CRAFT-pytorch — MIT-licensed, with no research-only or non-commercial
+restriction on the trained model. MIT requires its copyright notice to travel
+with redistributed copies:
+
+    CRAFT: Character Region Awareness for Text Detection
+    Copyright (c) 2019-present NAVER Corp.
+    Licensed under the MIT License; see https://github.com/clovaai/CRAFT-pytorch
+
+The docTR checkpoints are Apache-2.0, matching the docTR project itself.
+
+The EasyOCR and docTR license texts are in the bundled THIRD-PARTY-LICENSES.txt.
+A source checkout bundles neither weight set: EasyOCR downloads its own on
+first use, and the docTR models are fetched on demand
+(vodparse.cli.doctr_support fetch).
+
+
+================================================================================
+Optional GPU acceleration (not bundled)
+================================================================================
+
+On Windows, the application can download NVIDIA CUDA builds of PyTorch, but
+only after an explicit user request (File ▸ GPU Acceleration). Those wheels
+include NVIDIA proprietary components, are fetched directly from their
+publisher at the user's initiative, and are governed by NVIDIA's own license
+terms. They are not redistributed as part of this project, and no shipped
+build contains them.

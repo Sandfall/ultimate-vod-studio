@@ -1,0 +1,53 @@
+name: Build macOS
+
+# The macOS release build. Runs on a version tag, reuses build-mac-dev.yml for the build
+# itself (identical to a manual test build), then does the two things that make it a
+# release: has GitHub sign a build-provenance record for the zip, and attaches the zip to
+# the tag's GitHub Release. The provenance record is a verifiable statement that the
+# shipped file was built by this workflow, from this commit, on GitHub's runners — not on a
+# maintainer's machine. Anyone can check a download with:
+#   gh attestation verify UltimateVODStudio-macos.zip --repo <owner>/<repo>
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-mac-dev.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest   # standard runner: this job only moves the finished zip around
+    permissions:
+      contents: write        # uploading the zip to the tag's Release
+      id-token: write        # these two grants let GitHub sign the provenance record
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: UltimateVODStudio-macos
+
+      # Provenance records are only supported on public repos, so pre-publication test
+      # builds on a still-private repo skip this step — and their uploads carry no record.
+      # After the repo goes public, re-run the tag's build once so the assets users
+      # actually download are covered.
+      - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: UltimateVODStudio-macos.zip
+
+      # The Release for the tag normally exists already (the release flow creates it ahead
+      # of tagging, to host the model weights the build fetches). If the tag landed first,
+      # create a draft to hold the asset until the release notes are written.
+      - name: Upload to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+                  --title "$tag" --notes "Draft created by the build workflow to hold build assets."
+          fi
+          gh release upload "$tag" UltimateVODStudio-macos.zip \
+              --repo "$GITHUB_REPOSITORY" --clobber

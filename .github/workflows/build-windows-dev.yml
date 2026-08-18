@@ -1,0 +1,132 @@
+name: Build Windows (dev)
+
+# Builds the Windows desktop app (Ultimate VOD Studio) on a hosted Windows runner, since
+# PyInstaller can't cross-compile from Linux/macOS. This file is the build itself — venv,
+# deps, PyInstaller, the bundle gates — shared by both ways a build happens:
+#   - by hand from the Actions tab ("Run workflow"): a test build, whose zip stays a
+#     short-lived workflow artifact and never reaches users
+#   - called by build-windows.yml on a version tag, which then attests the zip and
+#     attaches it to the tag's GitHub Release
+# NOT on every push: Windows runners bill at 2x while the repo is private. The runtime weights/
+# dir is gitignored (not part of the checkout); build_windows.ps1 downloads it from the
+# project's GitHub Release via `python -m vodparse.cli.download_weights`
+# before invoking PyInstaller.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"   # matches local dev (3.13.x)
+          cache: pip
+
+      # The whole build (venv, deps, CPU torch, staged ffmpeg.exe + EasyOCR weights, PyInstaller)
+      # lives in build_windows.ps1 so CI and a local Windows build run the exact same steps.
+      # The token lets the weights step authenticate if it has to fetch from a GitHub Release
+      # that is still private (pre-publication test builds); it's unused otherwise.
+      - name: Build (build_windows.ps1)
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .\build_windows.ps1
+
+      # Guard against a silent weight-less build: UltimateVODStudio.spec skips-with-warning
+      # (not error) on any missing weights/*.pt, so a staging regression would otherwise ship
+      # an app that can't detect or read anything without failing CI. PyInstaller >=6 onedir
+      # builds put bundled data files under dist/<name>/_internal/ (only the .exe sits at the
+      # top level), and the spec's datas destination for these is ("weights/*.pt", "weights"):
+      # so the bundled weights land at dist/UltimateVODStudio/_internal/weights/*.pt.
+      - name: Verify bundled weights
+        shell: pwsh
+        run: |
+          $pts = Get-ChildItem dist/UltimateVODStudio/_internal/weights/*.pt
+          if ($pts.Count -ne 3) {
+              throw "expected 3 bundled weights (timer/character/m_char), found $($pts.Count)"
+          }
+          # The docTR text-engine models ship in the bundle too (staged by build_windows.ps1,
+          # bundled by the spec under doctr_models/models/): detector + recognizer.
+          $doctr = Get-ChildItem dist/UltimateVODStudio/_internal/doctr_models/models/*.pt
+          if ($doctr.Count -lt 2) {
+              throw "expected the bundled docTR models (DBNet + PARSeq), found $($doctr.Count)"
+          }
+          # And the EasyOCR weights (spec destination easyocr_models/model/): Reader(['en'])
+          # needs the CRAFT detector plus the English recognizer, so fewer than two means the
+          # staging download failed. Without this check a weight-less bundle ships happily and
+          # then tries to download at first analysis on the user's machine — which fails outright
+          # if they're offline or their certificate store can't verify the release host.
+          $easyocr = Get-ChildItem dist/UltimateVODStudio/_internal/easyocr_models/model/*.pth
+          if ($easyocr.Count -lt 2) {
+              throw "expected the bundled EasyOCR weights (CRAFT detector + English recognizer), found $($easyocr.Count)"
+          }
+
+      # Compliance gate. The app bundles GPL-3.0 (PyQt6) and LGPL (Qt 6, python-bidi,
+      # OpenCV's video backend) components, all of which require their license text to
+      # accompany the binary. The spec only warns when a licensing file is missing so a dev
+      # freeze still runs, which is exactly why CI has to be the thing that refuses to ship
+      # without it.
+      - name: Verify bundled license texts
+        shell: pwsh
+        run: |
+          foreach ($f in 'LICENSE', 'NOTICE') {
+              if (-not (Test-Path "dist/UltimateVODStudio/_internal/$f")) {
+                  throw "$f is missing from the bundle; the app must ship its own license text"
+              }
+          }
+          $doc = "dist/UltimateVODStudio/_internal/licenses/THIRD-PARTY-LICENSES.txt"
+          if (-not (Test-Path $doc)) {
+              throw "$doc is missing; did license_report.py bundle run before PyInstaller?"
+          }
+          $ffmpeg = "dist/UltimateVODStudio/_internal/licenses/FFMPEG-BUILD-CONFIG.txt"
+          if (-not (Test-Path $ffmpeg)) {
+              throw "$ffmpeg is missing; the bundled FFmpeg builds' licenses are readable only from the flags recorded there"
+          }
+          # Assert the copyleft texts specifically, not a file count. These are the ones
+          # that must accompany the binary, and a document that resolved but collected
+          # nothing would still pass a size check.
+          $text = Get-Content -Raw $doc
+          foreach ($needle in 'GNU GENERAL PUBLIC LICENSE',
+                              'GNU LESSER GENERAL PUBLIC LICENSE',
+                              'GNU AFFERO GENERAL PUBLIC LICENSE') {
+              if ($text -notmatch [regex]::Escape($needle)) {
+                  throw "'$needle' is absent from THIRD-PARTY-LICENSES.txt; the copyleft dependencies (PyQt6, Qt 6, Ultralytics) did not make it in"
+              }
+          }
+          # ...and that each copyleft distribution has its own section, because the three
+          # license bodies above are not attributable on their own: python-bidi's LGPL text
+          # alone would satisfy the LGPL needle with Qt 6 missing entirely. Section headers
+          # are written as "<name> <version>" at the start of a line by render_document().
+          foreach ($dist in 'PyQt6', 'PyQt6-Qt6', 'python-bidi', 'ultralytics') {
+              if ($text -notmatch "(?m)^$([regex]::Escape($dist)) \S") {
+                  throw "THIRD-PARTY-LICENSES.txt has no section for $dist; its license text did not make it into the bundle"
+              }
+          }
+
+      # Zip the app folder here, in the build, so every consumer gets the same bytes: on a
+      # release, build-windows.yml signs a provenance record for this exact file and attaches
+      # it to the GitHub Release, so the zip that gets attested must be the zip users
+      # download. (Uploading the bare folder as an artifact wouldn't do: GitHub re-zips
+      # artifact downloads on the fly, producing different bytes each download.)
+      - name: Zip the app
+        shell: pwsh
+        run: 7z a UltimateVODStudio-windows.zip .\dist\UltimateVODStudio\
+
+      # The downloadable result of a manual test build, and the hand-off to
+      # build-windows.yml's publish job on a release build. (Artifact downloads from the
+      # Actions UI arrive as a zip wrapping this zip — an artifact-storage quirk, harmless
+      # for a test build.)
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: UltimateVODStudio-windows
+          path: UltimateVODStudio-windows.zip
+          retention-days: 3        # builds are ~1GB; keep storage small
+          if-no-files-found: error

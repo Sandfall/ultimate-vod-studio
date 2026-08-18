@@ -1,0 +1,70 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.buildenv/
+.venv/
+# Staged static ffmpeg binary for the frozen build (downloaded by build_mac.sh, platform-specific)
+vendor/
+.DS_Store
+*.pt
+# ...but the deployment m_char classifier in models/ IS version-controlled (the YOLO weights under
+# runs/ are likewise force-tracked past the *.pt rule).
+!models/
+!models/*.pt
+# Runtime weights live flat in weights/ (logo/timer/character/m_char.pt): the layout the app
+# loads via vodparse.__init__. Populated from the GitHub Release (or copied from the promoted
+# runs//models checkpoints); intentionally NOT tracked: the *.pt rule above covers them.
+
+# App output (the GUI / pipeline stages)
+json_output/
+video_out/
+runs/
+
+# Video files never belong in the repo (vods live in other/, exports in video_out/: both
+# already ignored; this catches strays anywhere, e.g. a download left at the root)
+*.mp4
+*.mkv
+*.avi
+*.mov
+# Partial-download debris
+*.part
+
+# Manually-assembled inputs + scratch (vods, screenshots, datasets, debug, old, ...)
+other/
+
+# Tool-generated working data (created by scripts in tools/)
+tool_workspace/
+
+# Stray preview/backup files some tools drop in the cwd
+synth_vs_real_preview.png
+synth_tiles_*.png
+synth_gauges_preview.png
+real_portraits_labels.csv.bak-*
+*copy.png
+
+# Local working/master art for the app icon (not shipped)
+assets/source/
+
+# Opt-in TrimPlayer diagnostic traces (TRIMPLAYER_TRACE=1): local debug artifacts, not shipped
+debug_traces/
+
+# Crash/launch diagnostics the GUI writes into the workspace, which in a source checkout is the
+# repo root (vodparse.gui.crash_log, freeze_entry). Per-run local artifacts, never committed.
+crash.log
+crash.log.1
+launch_error.log
+
+# Generated at build time, not committed: THIRD-PARTY-LICENSES.txt is collected from the
+# installed wheels by tools/licensing/license_report.py and FFMPEG-BUILD-CONFIG.txt is the
+# configure line of the ffmpeg the build scripts staged. Both are resolve- and
+# machine-specific, so committing one platform's copy would ship the wrong text. licenses/
+# itself IS tracked — only these two generated files are not.
+licenses/THIRD-PARTY-LICENSES.txt
+licenses/FFMPEG-BUILD-CONFIG.txt
+
+# Local GUI screenshots + scratch QSettings dump: capture artifacts, not shipped
+gui_shots/
+
+# Scratch code-review notes: local working docs, not shipped
+code-review-fixes.md
