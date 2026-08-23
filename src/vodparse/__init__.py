@@ -15,7 +15,7 @@ from vodparse.runtime_paths import bundle_dir as _bundle_dir
 # Frozen-safe source of truth for the app version — read directly by the GUI's About
 # dialog (importlib.metadata is unreliable in the PyInstaller build). Keep this in sync
 # with `version` in pyproject.toml.
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 # Single source of truth for the public (OSS release) repo, as `owner/name`. The trained
 # weights and the packaged app builds both ship as this repo's GitHub Releases, so it's read

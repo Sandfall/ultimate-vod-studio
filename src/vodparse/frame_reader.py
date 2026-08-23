@@ -53,6 +53,19 @@ class FrameReader(threading.Thread):
         self._generation  = 0
 
     def seek(self, frame_number: int) -> None:
+        """Reposition the decode thread to `frame_number` (0-based). A target at or past
+        the end of the video is treated as reaching EOF: the reader stops and delivers no
+        further frames (``stopped`` becomes True; a subsequent read() times out).
+
+        Why not just let OpenCV handle it: OpenCV clamps a seek to the reported frame count
+        and converts that index to a time using the AVERAGE frame rate. On a variable-
+        frame-rate file (dropped frames in a recording, say) that time lands SHORT of the
+        real last frame, so read() keeps succeeding after every "past the end" seek and a
+        caller stepping forward in fixed increments never sees EOF: it loops forever on the
+        same tail frame. Stopping here is what makes the pipeline's seek loop terminate."""
+        if self._is_past_end(frame_number):
+            self.stopped = True
+            return
         with self._seek_lock:
             self._seek_target = frame_number
             self._generation += 1
@@ -62,6 +75,13 @@ class FrameReader(threading.Thread):
             self._queue.get_nowait()
         except queue.Empty:
             pass
+
+    def _is_past_end(self, frame_number: int) -> bool:
+        """True when `frame_number` is at or beyond the last frame (indices run 0 to
+        total_frames - 1). Always False when the container reports no frame count, since
+        then there's nothing to compare against and a sequential read is the only way
+        to find the end."""
+        return self.total_frames > 0 and frame_number >= self.total_frames
 
     @override
     def run(self) -> None:
