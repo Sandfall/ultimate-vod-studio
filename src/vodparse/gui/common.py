@@ -16,6 +16,11 @@ from PyQt6.QtWidgets import (QApplication, QLabel, QProgressDialog, QPushButton,
                              QRadioButton, QSizePolicy, QWidget)
 
 
+# The file-picker filter for choosing a source VOD, shared by every dialog that opens
+# one (the main window's Choose video…, the overlay-layout editor's browse).
+VIDEO_FILTER = "Videos (*.mp4 *.mov *.mkv *.avi *.webm);;All files (*)"
+
+
 def qobject_alive(obj: QObject) -> bool:
     """True while a Qt object's underlying C++ instance still exists.
 

@@ -41,6 +41,15 @@ MIN_SPLIT_MATCH_SEC = 20.0
 # settings story: one shared key read by vodparse.gui.app's SettingsDialog and screen.py, default on.
 SETTING_MARK_INGAME_FALLBACK = "review/mark_ingame_fallback"  # bool, default True
 
+# How far into a game the playhead lands when the user clicks a game row inside a set. Production
+# often cuts to the game a second or two after the detected start, so the first frame tends to show
+# the transition or the previous scene; a small offset lands on the game itself. Game rows only: a
+# set row still opens on its first frame. User setting shared by SettingsDialog and screen.py;
+# the default of 0 keeps the long-standing "land on the start" behaviour until the user tunes it.
+SETTING_MATCH_SEEK_OFFSET_SEC = "review/match_seek_offset_sec"  # seconds, default below
+MATCH_SEEK_OFFSET_SEC_DEFAULT = 0.0
+MATCH_SEEK_OFFSET_SEC_MAX = 30.0   # the Settings spinbox ceiling; past this it's no longer a "lag"
+
 # The in-game-fallback marker tint (SETTING_MARK_INGAME_FALLBACK): a teal that reads as informational,
 # deliberately outside the amber/yellow warning family above so a fallback never looks like a flag. Same
 # light + *_DARK convention: the base reads on a pale background, the *_DARK sibling on a dark one.
@@ -110,6 +119,10 @@ class ReviewClip(Clip):
       which likewise has no derived baseline. A restructure re-derives every bound, then
       re-stamps the marked ones per this flag (see the bound-routing helpers below).
 
+    One ``Clip`` key goes the other way: ``first_game_sec`` is never stored on a
+    ``ReviewClip``. ``build_reviewed_data`` derives it at export, from the first game the
+    clip includes, so it can't go stale when a split or merge changes the set's games.
+
     This is the shape the whole review pipeline is typed against: the constructors
     (make_clip, clip_from_draft, copy_clips) set every non-NotRequired key, and every
     transform/reader takes and returns it. The per-player list fields keep ``Clip``'s
@@ -144,6 +157,16 @@ def hms(seconds: float) -> str:
     h, rem = divmod(s, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def match_seek_target(match_start: float, match_end: float, offset_sec: float) -> float:
+    """Where the playhead lands when a game row is clicked: ``offset_sec`` into the game (see
+    SETTING_MATCH_SEEK_OFFSET_SEC). A game shorter than the offset would otherwise land on or past
+    its own end, i.e. on the next game, so such a game opens on its start instead."""
+    target = match_start + offset_sec
+    if target >= match_end:
+        return match_start
+    return target
 
 
 def seed_bounds(start_marker: Marker, end_marker: Marker) -> tuple[float, float]:
@@ -364,6 +387,7 @@ def build_reviewed_data(clips: list[ReviewClip], meta: ReviewMeta) -> ReviewedDa
             "characters": clip["characters"],
             "round": clip["round"],
             "best_of": clip["best_of"],
+            "first_game_sec": included_span(clip)[0]["start"]["timestamp_sec"],
         }
 
     # Sets flagged "exclude from export" are dropped here, so they never reach reviewed.json

@@ -42,7 +42,7 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
-from vodparse import gpu_support
+from vodparse import gpu_support, net
 from vodparse.jsonio import write_json_atomic
 
 # The progress bar is split across the install's phases so it keeps moving in each of them.
@@ -90,7 +90,10 @@ def _download_and_verify(wheel: gpu_support.Wheel, dest: Path,
     digest = hashlib.sha256()
     written = 0
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SEC) as response, \
+    # The explicit SSL context (system roots + certifi) is what lets the download verify on
+    # a fresh Windows install; see vodparse.net. A file:// URL (the tests) ignores it.
+    with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SEC,
+                                context=net.make_ssl_context()) as response, \
             open(dest, "wb") as out:  # noqa: S310 - pinned https/file URL
         while chunk := response.read(_CHUNK_BYTES):
             out.write(chunk)

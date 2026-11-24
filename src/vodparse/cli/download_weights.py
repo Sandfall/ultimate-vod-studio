@@ -32,6 +32,7 @@ import urllib.error
 from pathlib import Path
 
 from vodparse import PUBLIC_REPO, github_releases
+from vodparse.games import shipped_weight_files
 
 # The public release repo whose GitHub Releases carry the weights. Override with --repo.
 # Aliased from the package-level single source of truth (see vodparse.PUBLIC_REPO). This module
@@ -41,10 +42,13 @@ from vodparse import PUBLIC_REPO, github_releases
 DEFAULT_REPO = PUBLIC_REPO
 _USER_AGENT = "ultimate-vod-studio-weight-fetcher"
 
-# The weights the app expects in weights/ (used only to warn if a release is missing one).
-# logo.pt (the go/game detector) is intentionally absent: it's no longer distributed. The GUI
-# always runs seek mode and never loads it; go/game CLI mode is opt-in and supplies its own weight.
-EXPECTED = ("timer.pt", "character.pt", "m_char.pt")
+# The weights the app expects in weights/ (used only to warn if a release is missing one),
+# as bare filenames since release assets are flat: derived from the game registry
+# (vodparse.games) rather than listed here, so a future game's weights need no edit to this
+# file. logo.pt (the go/game detector) is intentionally absent: it's no longer distributed.
+# The GUI always runs seek mode and never loads it; go/game CLI mode is opt-in and supplies
+# its own weight.
+EXPECTED = tuple(Path(f).name for f in shipped_weight_files())
 
 
 def fetch_release(repo: str, tag: str | None, token: str | None) -> dict:

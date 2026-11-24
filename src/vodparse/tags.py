@@ -2,21 +2,30 @@
 across a match's frames to produce a stable label for each player."""
 
 import argparse
+import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from functools import partial
 from statistics import median
 from typing import cast
 
 from vodparse.bbox import (bbox_max_x, bbox_min_x, bbox_center_y, bbox_center_x, bbox_height,
                               best_mirrored_pair, drop_sublabels, longest_text)
+from vodparse.games import (INGAME_BAND_CHARACTER, INGAME_BAND_MODES, INGAME_BAND_NONE,
+                            INGAME_BAND_TAGS, ULTIMATE_INGAME_HUD)
 from vodparse.grouping import IMPOSTOR_MIN_IDENTITIES, confirmed_identity_count, similar
-from vodparse.schema import Event, Match, TagEntry, TextBox
+from vodparse.schema import Event, LayoutRead, Match, TagEntry, TextBox
 from vodparse.overlay_filter import (filter_static_overlays, find_persistent_graphics,
                                         strip_banners)
+from vodparse.overlay_layout import (REGION_BEST_OF, REGION_INGAME_P1, REGION_INGAME_P2,
+                                     REGION_PLAYER1, REGION_PLAYER2, REGION_ROUND,
+                                     CustomOverlayLayout)
+from vodparse.overlay_regions import OverlayRegions, layout_overlay_regions
 from vodparse.text_utils import (SEPARATOR_CHARS, clean_sponsor, alnum_fold, is_best_of_label,
-                                    is_ignored_tag_text, is_numeric_text, is_progress_label,
-                                    is_round_text, normalize_ocr, parse_best_of, round_priority,
+                                    is_ignored_tag_text, is_misread_pronoun_set, is_numeric_text,
+                                    is_progress_label, is_punctuation_only, is_round_text, normalize_ocr, parse_best_of, round_priority,
                                     split_tag_sponsor)
 from vodparse.voting import (vote, vote_weighted, vote_optional, is_unanimous, collect_positioned,
                                 collect_positioned_entries)
@@ -55,14 +64,18 @@ OVERLAY_BOTTOM_FRAC = 0.92
 # recover them; the tournament reader and row learner keep the fixed 0.92 because their text
 # never shrinks. Floor ~0.86: below that the band reaches the damage-counter / spell-menu rows
 # and the full-frame overlay handle plates (~0.78h), which can out-vote the real nametags.
-INGAME_TAG_BAND_FRAC_DEFAULT = OVERLAY_BOTTOM_FRAC
+# The number itself lives on Ultimate's profile (vodparse.games.ULTIMATE_INGAME_HUD): the
+# in-game HUD is a property of the game, not the stream, so each game declares its own. It
+# happens to equal OVERLAY_BOTTOM_FRAC (a test pins the equality): keep the two in step,
+# since pipeline.detect_text crops at min(this, OVERLAY_BOTTOM_FRAC).
+INGAME_TAG_BAND_FRAC_DEFAULT = ULTIMATE_INGAME_HUD.name_band_top
 
 # The lowest the in-game band may be widened to. Below this the band reaches the damage-counter
 # row (~0.86-0.89h) and the full-frame overlay handle plates (~0.78h): non-nametag text that can
 # out-vote the real pair: so the CLI/GUI clamp here. It is above the spell-menu / resource-gauge
 # rows (~0.78-0.84h) on purpose: 0.86 is the boundary between "numeric percents (still filtered)"
 # and "arbitrary character HUD text (not reliably filtered)".
-INGAME_TAG_BAND_FRAC_FLOOR = 0.86
+INGAME_TAG_BAND_FRAC_FLOOR = ULTIMATE_INGAME_HUD.name_band_floor
 
 
 def parse_ingame_tag_band_frac(value: str) -> float:
@@ -123,6 +136,154 @@ def attach_ingame_tags(match: Match, frame_width: int = 1920, frame_height: int 
 
     match["ingame_tags"]           = ingame_tags
     match["ingame_tags_confirmed"] = confirmed
+    return match
+
+
+# ── Character names read from the in-game band ────────────────────────────────
+
+# Roster snap. Rivals 2 prints the characters' names where Ultimate prints the
+# players' tags, and a recognizer's misreads on that HUD font are systematic (on a real
+# Rivals 2 VOD, 2026-09-03/04: EasyOCR read an O as D or @ and an R as P; docTR read one
+# "U" as "LI"), so a per-match majority vote can lock in a misspelling. The game's roster
+# (vodparse.games.Game.roster, a bundled JSON list, never source) lets each voted name snap
+# to the real spelling; attach_band_characters applies it when a roster is given.
+#
+# The folding is roster-specific, not grouping.similar's: that comparator folds toward
+# digits (o -> 0) to merge gamertag variants, whereas a character name is a dictionary word
+# whose misreads are letter-for-letter shape swaps. Lowercase keys only (_roster_canonical
+# lowercases first).
+_ROSTER_CONFUSABLES = str.maketrans({
+    "d": "o", "@": "o", "0": "o",   # a clipped or broken O reads as D, @ or zero
+    "p": "r",                       # an R with its leg lost reads as P
+})
+
+# A read snaps to a roster name when its canonical form is at least this similar (difflib
+# ratio, 0..1). Lower than grouping's 0.85 on purpose: a dropped final letter on a 5-letter
+# name scores 0.80, and a roster is a closed list of dissimilar words, so a looser match is
+# still safe. A read below the bar keeps its raw spelling.
+_ROSTER_SIMILARITY_THRESHOLD = 0.8
+
+
+def _roster_canonical(name: str) -> str:
+    """Lowercase and fold the recognizer's shape confusables so a misread and the real name
+    compare equal where they only differ by one of the known swaps."""
+    return name.strip().lower().translate(_ROSTER_CONFUSABLES)
+
+
+def snap_to_roster(name: str, roster: Sequence[str]) -> str:
+    """The roster entry ``name`` most likely is, spelled the roster's way, or ``name`` itself
+    when nothing on the roster is close enough (see _ROSTER_SIMILARITY_THRESHOLD). An exact
+    canonical match wins outright; otherwise the closest entry by ratio, if it clears the
+    bar. An empty roster returns ``name`` unchanged."""
+    canonical = _roster_canonical(name)
+    best_entry: str | None = None
+    best_ratio = 0.0
+    for entry in roster:
+        entry_canonical = _roster_canonical(entry)
+        if entry_canonical == canonical:
+            return entry
+        ratio = SequenceMatcher(None, canonical, entry_canonical).ratio()
+        if ratio > best_ratio:
+            best_entry, best_ratio = entry, ratio
+    if best_entry is not None and best_ratio >= _ROSTER_SIMILARITY_THRESHOLD:
+        return best_entry
+    return name
+
+
+def attach_band_characters(match: Match, frame_width: int = 1920, frame_height: int = 1080,
+                           ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT,
+                           roster: Sequence[str] = ()) -> Match:
+    """Vote the characters' names out of the in-game nameplate band (INGAME_BAND_CHARACTER:
+    a game like Rivals 2 prints the character's name where Ultimate prints the
+    player's tag). The same left/right mirrored-pair finder as attach_ingame_tags, routed into
+    ``characters`` in place of a portrait detector's vote; ``ingame_tags`` is left unread
+    (None, unconfirmed), so set grouping uses the stream overlay's tags alone. With a
+    `roster` (the game's character names, see games.load_roster) each voted name snaps to
+    the roster's spelling (snap_to_roster); an empty roster keeps the raw reads."""
+    finder  = partial(find_player_names, frame_width=frame_width, frame_height=frame_height,
+                      ingame_tag_frac=ingame_tag_frac)
+    columns = collect_positioned(match["frames"], finder)
+
+    match["ingame_tags"]           = None
+    match["ingame_tags_confirmed"] = False
+    if not columns:
+        match["characters"] = None
+        return match
+
+    names = [vote(col) for col in columns]
+    if not all(is_unanimous(col, name) for col, name in zip(columns, names)):
+        print(f"  Note: ingame character names varied across frames for match "
+              f"{match['match_number']} → voted {names}")
+    if roster:
+        snapped = [snap_to_roster(name, roster) if name else name for name in names]
+        changed = [f"{before!r} → {after!r}" for before, after in zip(names, snapped)
+                   if before is not None and before != after]
+        if changed:
+            print(f"  Note: character names snapped to the roster for match "
+                  f"{match['match_number']}: {', '.join(changed)}")
+        names = snapped
+    match["characters"] = names
+    return match
+
+
+def nameplates_from_boxes(layout: CustomOverlayLayout | None, ingame_band: str) -> bool:
+    """Whether a run votes the in-game nameplates from its layout's drawn nameplate boxes
+    (attach_layout_ingame) rather than searching the band for them: a drawn box on either
+    side, in any band mode but INGAME_BAND_NONE (a band read as nothing is left unread, boxes
+    or no boxes). The layout's own rule (CustomOverlayLayout.reads_ingame_boxes, which also
+    decides whether the pipeline reads the boxes at all), checked against the run's resolved
+    `ingame_band` too, since the callers route the rest of the read on that. The one rule
+    both the vote (enrich_match) and the per-frame inspection CSV (vodparse.debug) route on,
+    so the two can never disagree on where a nameplate came from."""
+    return ingame_band != INGAME_BAND_NONE and layout is not None and layout.reads_ingame_boxes
+
+
+def attach_layout_ingame(match: Match, layout: CustomOverlayLayout, ingame_band: str,
+                         roster: Sequence[str] = ()) -> Match:
+    """Vote the in-game nameplates from a custom layout's drawn nameplate boxes
+    (``layout.ingame_p1`` / ``ingame_p2``, read per frame into ``event["layout_reads"]`` by
+    cli.pipeline) instead of searching the band for a mirrored pair: the user drew where
+    each side's plate sits, so every frame's read of a box is that side's candidate, and a
+    side with no box drawn is simply not read (None). Routed by `ingame_band` exactly like
+    the band search: INGAME_BAND_TAGS fills ``ingame_tags`` (confirmed when every drawn side
+    read unanimously), INGAME_BAND_CHARACTER fills ``characters`` (snapped to `roster` when
+    one is given) and leaves ``ingame_tags`` unread."""
+    reads_per_frame = [frame.get("layout_reads", {}) for frame in match["frames"]]
+    sides: list[str | None] = []
+    unanimous = True
+    for key, box in ((REGION_INGAME_P1, layout.ingame_p1), (REGION_INGAME_P2, layout.ingame_p2)):
+        if box is None:
+            sides.append(None)
+            continue
+        texts = [read["text"] for reads in reads_per_frame
+                 if (read := reads.get(key)) is not None and read["text"]]
+        winner = vote(texts)
+        sides.append(winner)
+        unanimous = unanimous and (winner is None or is_unanimous(texts, winner))
+    read_anything = any(side is not None for side in sides)
+
+    if ingame_band == INGAME_BAND_CHARACTER:
+        match["ingame_tags"] = None
+        match["ingame_tags_confirmed"] = False
+        if not read_anything:
+            match["characters"] = None
+            return match
+        if roster:
+            snapped = [snap_to_roster(side, roster) if side else side for side in sides]
+            changed = [f"{before!r} → {after!r}" for before, after in zip(sides, snapped)
+                       if before is not None and before != after]
+            if changed:
+                print(f"  Note: character names snapped to the roster for match "
+                      f"{match['match_number']}: {', '.join(changed)}")
+            sides = snapped
+        match["characters"] = sides
+        return match
+
+    match["ingame_tags"] = sides if read_anything else None
+    match["ingame_tags_confirmed"] = read_anything and unanimous
+    if read_anything and not unanimous:
+        print(f"  Note: ingame nameplate boxes varied across frames for match "
+              f"{match['match_number']} → voted {sides}")
     return match
 
 
@@ -378,6 +539,173 @@ def _pick_gamertag_box(row: list[TextBox], bottom_overlay: bool = False) -> Text
     return longest
 
 
+# A player's overlay row often ends in furniture far from the name: flags, a character icon,
+# the score. OCR can read an icon as letters ("se 0" off an icon and a score), and as the
+# last box on the row that read would win the gamertag pick. Boxes further apart than this
+# many text heights are not one name: a sponsor sits about one height from its tag, while
+# the furniture measured on a stacked scoreboard panel sat 9 to 13 heights away.
+_ROW_STRAGGLER_GAP_HEIGHTS = 4.0
+
+
+def _letter_count(boxes: list[TextBox]) -> int:
+    """How many letters a run of boxes holds between them."""
+    return sum(char.isalpha() for box in boxes for char in box["text"])
+
+
+def _runs_along_row(boxes: list[TextBox]) -> list[list[TextBox]]:
+    """`boxes` left to right, cut into runs wherever the empty space between two
+    neighbours is wider than _ROW_STRAGGLER_GAP_HEIGHTS times the taller one's height.
+    The one gap rule for a row's furniture, on the tag line and the sponsor line alike."""
+    ordered = sorted(boxes, key=bbox_min_x)
+    runs: list[list[TextBox]] = [[ordered[0]]]
+    for box in ordered[1:]:
+        previous = runs[-1][-1]
+        gap = bbox_min_x(box) - max(bbox_max_x(member) for member in runs[-1])
+        limit = _ROW_STRAGGLER_GAP_HEIGHTS * max(bbox_height(previous), bbox_height(box))
+        if gap > limit:
+            runs.append([box])
+        else:
+            runs[-1].append(box)
+    return runs
+
+
+def _drop_row_stragglers(row: list[TextBox]) -> list[TextBox]:
+    """The part of one player's overlay row that holds the name: of the row's runs
+    (_runs_along_row) the one with the most letters is kept (the leftmost on a tie) and
+    the rest dropped. A row with no wide gap comes back whole."""
+    return max(_runs_along_row(row), key=_letter_count)   # max() keeps the first run on a tie
+
+
+def _tag_line_top(tag_line: list[TextBox]) -> float:
+    """The top edge of the gamertag's line: that of its lowest-centred box."""
+    lowest = max(tag_line, key=bbox_center_y)
+    return bbox_center_y(lowest) - bbox_height(lowest) / 2
+
+
+# How far past the gamertag's own x-extent, in tag-line text heights, the sponsor line may
+# start or end and still count as printed over the tag: a sponsor is set flush with or a
+# little before its tag, never a word's width away.
+_SPONSOR_LINE_SLACK_HEIGHTS = 1.0
+
+
+def _above_the_tag_line(boxes: list[TextBox], tag_line: list[TextBox]) -> list[TextBox]:
+    """The boxes of `boxes` whose centre sits above the gamertag line's top edge."""
+    top = _tag_line_top(tag_line)
+    return [box for box in boxes if bbox_center_y(box) < top]
+
+
+def _over_the_tag(above: list[TextBox], tag_line: list[TextBox]) -> list[TextBox]:
+    """The boxes of `above` (boxes on the line above the gamertag) that sit OVER it: their
+    run (_runs_along_row, the same gap rule as the tag line's stragglers) sharing some
+    x-extent with the tag line, widened by _SPONSOR_LINE_SLACK_HEIGHTS of the tag line's
+    height on each side. A sponsor is printed over its tag; a flag or an icon read as
+    letters further along the panel, one line up, is furniture, however high it sits.
+    Left to right."""
+    if not above:
+        return []
+    slack = _SPONSOR_LINE_SLACK_HEIGHTS * max(bbox_height(box) for box in tag_line)
+    tag_x0 = min(bbox_min_x(box) for box in tag_line) - slack
+    tag_x1 = max(bbox_max_x(box) for box in tag_line) + slack
+    over: list[TextBox] = []
+    for run in _runs_along_row(above):
+        if min(bbox_min_x(box) for box in run) <= tag_x1 and max(bbox_max_x(box) for box in run) >= tag_x0:
+            over.extend(run)
+    return over
+
+
+def _split_stacked_sponsor(row: list[TextBox]) -> tuple[list[TextBox], str | None]:
+    """Take a sponsor line printed above the gamertag out of one player's overlay row. Some
+    overlays print the sponsor on its own line over the tag, inside the same panel (and push
+    the tag down to make room). The two are told apart by POSITION alone: the lowest line
+    is the gamertag and what sits above it, over it, is the sponsor (_over_the_tag). Not by
+    length (a sponsor is often the longer word of the two), and not by size either (some
+    overlays print both lines alike; smaller text UNDER a tag, a seed or a handle, is
+    already gone by the time this runs: bbox.drop_sublabels).
+
+    Everything above the tag line leaves the row: the sponsor as the sponsor, and anything
+    further along the row (a flag, an icon read as letters) as furniture, which can be
+    neither the sponsor nor the tag. Returns the tag line and the sponsor, left to right
+    (None when nothing sits over the tag)."""
+    tag_line_top = _tag_line_top(row)
+    tag_line = [box for box in row if bbox_center_y(box) >= tag_line_top]
+    above = [box for box in row if bbox_center_y(box) < tag_line_top]
+    over = _over_the_tag(above, tag_line)
+    sponsor = clean_sponsor(" ".join(box["text"].strip() for box in over)) if over else None
+    return tag_line, sponsor
+
+
+# What OCR leaves around a lone number ("(2)", "3.", "- 0"): stripped before deciding
+# whether a numeric text is a sponsor. "%" is deliberately not in it.
+_NUMBER_WRAP_CHARS = "()[]{}<>-_.,:;'\"| "
+# The one shape a numeric sponsor has been seen in: a whole number with a percent sign
+# ("69%"). A damage read carries a decimal point ("126.5%"; and sits on the HUD, not in a
+# player's row), a clock a colon ("6:59"), a merged score a space ("2 1"), a seed a hash
+# ("#3"): none of those is a sponsor.
+_NUMERIC_SPONSOR_RE = re.compile(r"^\d+%$")
+
+
+def _numeric_sponsor_above(numbers: list[TextBox], tag_line: list[TextBox]) -> str | None:
+    """A sponsor spelled only in digits and symbols ("69%"), read from the line above the
+    gamertag. Numeric texts are dropped from a player row because a score, a seed or a
+    clock is never a name; but the line above the tag is where a sponsor sits. So a numeric
+    text over the tag (_over_the_tag) is kept as the sponsor when it has the one numeric
+    sponsor shape seen so far (_NUMERIC_SPONSOR_RE); a bare number, a score, a clock or a
+    damage read there is still what it looks like.
+
+    `numbers` are the row's numeric boxes, `tag_line` the boxes of the gamertag's line.
+    Returns the kept texts, bare of what OCR wrapped them in and of a space before the
+    sign ("69 %"), left to right, or None."""
+    kept: list[str] = []
+    for box in _over_the_tag(_above_the_tag_line(numbers, tag_line), tag_line):
+        bare = box["text"].strip(_NUMBER_WRAP_CHARS).replace(" ", "")
+        if _NUMERIC_SPONSOR_RE.match(bare):
+            kept.append(bare)
+    return " ".join(kept) or None
+
+
+def read_player_row(texts: list[TextBox]) -> TagEntry | None:
+    """Fold the word boxes read inside ONE player's overlay box (a drawn layout box, or a row
+    the side-bar pre-pass locked) into that player's gamertag and sponsor. Such a box holds a
+    whole overlay row, not just the name: "Rob jr  blargh257  SHE/HER/HERS  [flags]  0" on a
+    stacked scoreboard panel, "Darkatma" over a "Seed 5" sub-label in a side column. The
+    per-side row logic of the tournament reader already knows how to read that shape, so
+    this composes it rather than re-deciding anything: drop the content that can never be a
+    tag (scores and other numerics, pronoun sets, @handles, seed labels, standalone [W]/[L]
+    markers: is_ignored_tag_text; and a pronoun pill OCR misread, "She/HeR/HEAS":
+    is_misread_pronoun_set), drop sub-labels shadowed by a taller box above them
+    (drop_sublabels), take a sponsor line printed over the tag out of the row
+    (_split_stacked_sponsor: the lower line is the tag, whatever the two lines' lengths or
+    sizes; a numeric sponsor there, "69%", is kept too: _numeric_sponsor_above), drop
+    partial re-reads of one plate (_drop_contained_reads), drop what sits far along the
+    row from the name (flags, an icon and a score read as text: _drop_row_stragglers),
+    pick the gamertag box with the at-bottom rule (the tag is the LAST box on a panel row,
+    so a long sponsor to its left is peeled: _pick_gamertag_box) and split the sponsor off
+    the row (_split_sponsor_from_row). Returns the TagEntry (tag in "text", sponsor in
+    "sponsor"), or None when nothing tag-like survives. Every caller votes the result
+    across frames."""
+    candidates = [t for t in texts
+                  if t["text"].strip()
+                  and not is_ignored_tag_text(t["text"])
+                  and not is_misread_pronoun_set(t["text"])]
+    numbers = [t for t in candidates if is_numeric_text(t)]
+    row = drop_sublabels([t for t in candidates if not is_numeric_text(t)])
+    if not row:
+        return None
+    # The sponsor line comes out before the duplicate check: that check takes two boxes
+    # sharing an x-extent for two reads of ONE plate and keeps the longer text, which on a
+    # stacked panel is the sponsor as often as the tag.
+    row, stacked_sponsor = _split_stacked_sponsor(row)
+    if stacked_sponsor is None and numbers:
+        stacked_sponsor = _numeric_sponsor_above(numbers, row)
+    row = _drop_row_stragglers(_drop_contained_reads(row))
+    entry = _split_sponsor_from_row(row, _pick_gamertag_box(row, bottom_overlay=True))
+    if not entry["text"].strip():
+        return None
+    if entry["sponsor"] is None:
+        entry["sponsor"] = stacked_sponsor
+    return entry
+
+
 def _banded_tag_pair(cand: list[TextBox], mid: float,
                      tag_row_y: float) -> list[TagEntry | None] | None:
     """The at-bottom sided pick against a learned tag row: each side's row is its boxes within
@@ -417,7 +745,8 @@ def _x_gated(texts: list[TextBox], frame_width: int) -> list[TextBox]:
 
 def _sided_tag_pair(upper: list[TextBox], frame_width: int, y_tolerance: int,
                     stacked: bool = False, at_bottom: bool = False,
-                    tag_row_y: float | None = None) -> list[TagEntry | None] | None:
+                    tag_row_y: float | None = None,
+                    filtered_metadata: list[TextBox] | None = None) -> list[TagEntry | None] | None:
     """Symmetric overlay: a `[sponsor?][gamertag]` cluster on each side of center. On each side
     take a text row and read the gamertag from it (see _pick_gamertag_box: usually the longest
     box, since sponsors are short abbreviations); the remaining boxes and any sponsor prefix inside
@@ -429,7 +758,12 @@ def _sided_tag_pair(upper: list[TextBox], frame_width: int, y_tolerance: int,
     the row *below* a metadata line with `stacked`, and the *bottommost* with `at_bottom` (the
     overlay sits over the in-game HUD, so the tag hugs the bottom edge and HUD sits above it)
     unless `tag_row_y` carries a VOD-wide learned row, in which case the at-bottom pick anchors
-    on that row instead and may return per-side ``None`` slots (see _banded_tag_pair)."""
+    on that row instead and may return per-side ``None`` slots (see _banded_tag_pair).
+
+    `filtered_metadata` (stacked only) are the band's boxes the content filter dropped (seed
+    captions, pronoun and handle lines). When no metadata line survived the filter on either
+    side, the anchor falls on the gamertag row itself and nothing reads below it; the stacked
+    pick is then retried anchored on those dropped lines, which is where the metadata sits."""
     mid = frame_width / 2
     bottom_overlay = at_bottom and not stacked
     # Tags and sponsors sit in a band beside center: drop dead-center labels/logos ("BEST OF 5",
@@ -444,6 +778,14 @@ def _sided_tag_pair(upper: list[TextBox], frame_width: int, y_tolerance: int,
     # row and skip it: the other side's surviving metadata keeps the anchor on the real top line.
     meta_top = min((bbox_center_y(t) for t in cand), default=0.0) if stacked else 0.0
     rows = _pick_tag_rows(cand, mid, y_tolerance, stacked, meta_top, at_bottom=at_bottom)
+    if rows is None and stacked and filtered_metadata:
+        # Both sides' metadata were content-filtered ("SEED 10" / "SEED23" above the tags on
+        # a 2026 stacked overlay): anchor on the dropped lines instead. Only as a fallback, so a frame the
+        # surviving boxes already anchor reads exactly as before.
+        dropped = _x_gated(filtered_metadata, frame_width)
+        if dropped:
+            meta_top = min(bbox_center_y(t) for t in [*cand, *dropped])
+            rows = _pick_tag_rows(cand, mid, y_tolerance, stacked, meta_top, at_bottom=at_bottom)
     if rows is None:
         return None
     rows = [_drop_contained_reads(row) for row in rows]   # duplicate re-reads of one plate
@@ -560,6 +902,10 @@ def find_tournament_tags(texts: list[TextBox], y_tolerance: int = 20, sym_tolera
     # band, so evidence is meaningful only for the (not at_bottom) case; the at-bottom
     # learned-row path has its own None-slot mechanism.
     band: list[TextBox] = []
+    # The boxes dropped as never-a-tag text (a seed caption, a pronoun or handle line): on a
+    # stacked overlay that is the metadata line itself, which _sided_tag_pair falls back on
+    # to anchor the tag row when no metadata line survived the filter.
+    filtered_metadata: list[TextBox] = []
     saw_overlay_label = False
     for t in texts:
         if not in_band(t):
@@ -567,8 +913,10 @@ def find_tournament_tags(texts: list[TextBox], y_tolerance: int = 20, sym_tolera
         if is_round_text(t) or parse_best_of(t["text"]) or is_best_of_label(t["text"]):
             saw_overlay_label = True
             continue
-        if (is_numeric_text(t) or is_ignored_tag_text(t["text"])
-                or (stacked and is_progress_label(t["text"]))):
+        if is_ignored_tag_text(t["text"]):
+            filtered_metadata.append(t)
+            continue
+        if is_numeric_text(t) or is_punctuation_only(t) or (stacked and is_progress_label(t["text"])):
             continue
         band.append(t)
     overlay_evidence = saw_overlay_label and not at_bottom
@@ -588,7 +936,7 @@ def find_tournament_tags(texts: list[TextBox], y_tolerance: int = 20, sym_tolera
         # Salvage is likewise exempt: a 1-box band is exactly the lone-tag case it recovers.
         return None
     sided = _sided_tag_pair(band, frame_width, y_tolerance, stacked=stacked, at_bottom=at_bottom,
-                            tag_row_y=tag_row_y)
+                            tag_row_y=tag_row_y, filtered_metadata=filtered_metadata)
     if sided is not None or stacked or (at_bottom and tag_row_y is not None):
         return sided
     # Remnants the per-side reader missed: fall back to mirror pairing. Same gates as the sided
@@ -765,6 +1113,94 @@ def attach_tournament_overlay(match: Match, frame_width: int = 1920, frame_heigh
     return match
 
 
+def _player_entry(read: LayoutRead) -> tuple[str, str | None]:
+    """One frame's (gamertag, sponsor) from a player box's read. A read made since the
+    pipeline folds player boxes (LayoutRead.sponsor present) carries the row logic's own
+    split; an older run's read is the joined row text, split the way the heuristic path
+    splits a box (split_tag_sponsor)."""
+    if "sponsor" in read:
+        return read["text"], read["sponsor"]
+    return split_tag_sponsor(read["text"])
+
+
+def _region_text(reads: dict[str, LayoutRead], key: str) -> str | None:
+    """What one frame's read of region ``key`` says, or None when the region read nothing
+    or wasn't read on that frame."""
+    read = reads.get(key)
+    if read is None or not read["text"]:
+        return None
+    return read["text"]
+
+
+def attach_overlay_regions(match: Match, regions: OverlayRegions,
+                           frame_height: int = 1080) -> Match:
+    """Vote the tournament overlay from the per-frame reads of the run's overlay regions
+    (``event["layout_reads"]``, written by cli.pipeline) instead of locating it with the
+    position heuristics above. The regions say where each field sits, whether the user
+    drew them (a custom layout) or the side-bar pre-pass locked them
+    (vodparse.overlay_regions), so every frame's read of a box is that field's candidate.
+    A player's sponsor comes from the sponsor row read beside their box when the regions
+    hold one (a stream that prints the sponsor on the line above the tag), else from the
+    sponsor the player box's own read split off its row (_player_entry). Each field comes
+    from its box when the regions hold one and keeps its built-in reading otherwise:
+    regions without the gamertag boxes leave ``tournament_tags`` / ``tournament_sponsors``
+    as the heuristics set them (enrich_match runs those first in that case), and round /
+    best-of without a box come from the built-in content-matched finders over the frame
+    texts (they fire only on round/best-of vocabulary, so the fallback can't invent a
+    field the overlay lacks). In-game tags and characters are untouched: they never came
+    from the overlay."""
+    reads_per_frame = [frame.get("layout_reads", {}) for frame in match["frames"]]
+
+    if regions.reads_player_boxes:
+        tags: list[str | None] = []
+        sponsors: list[str | None] = []
+        for key in (REGION_PLAYER1, REGION_PLAYER2):
+            # The frames where this player's box read a tag: both the tag and the sponsor
+            # vote over these, so a sponsor row that stays blank on them outvotes a stray read.
+            # A stored read the tag filters reject is no read: a run analysed before a filter
+            # learned that text keeps it in its layout_reads ("SEEDI", a misread seed caption,
+            # on a 2026 Melee stream), and re-extracting must not need a re-analysis.
+            read_frames = [reads for reads in reads_per_frame
+                           if (text := _region_text(reads, key)) is not None
+                           and not is_ignored_tag_text(text)]
+            entries = [_player_entry(reads[key]) for reads in read_frames]
+            tags.append(vote([tag for tag, _sponsor in entries if tag]))
+            sponsor_key = regions.sponsor_key(key)
+            if sponsor_key is not None:
+                # A blank or missing sponsor read votes None, so absence competes
+                # (vote_optional): one noisy read can't win over a row that is empty.
+                sponsors.append(vote_optional([_region_text(reads, sponsor_key)
+                                               for reads in read_frames]))
+            else:
+                sponsors.append(vote_optional([sponsor for _tag, sponsor in entries]))
+        if any(tag is not None for tag in tags):
+            match["tournament_tags"] = tags
+            match["tournament_sponsors"] = sponsors
+        else:
+            match["tournament_tags"] = None
+            match["tournament_sponsors"] = None
+
+    if REGION_ROUND in regions.boxes:
+        match["round"] = vote([normalize_ocr(read["text"]) for reads in reads_per_frame
+                               if (read := reads.get(REGION_ROUND)) is not None and read["text"]])
+    else:
+        match["round"] = _vote_round([
+            rnd["text"] for frame in match["frames"]
+            if (rnd := find_round(frame.get("texts", []), frame_height)) is not None])
+    if REGION_BEST_OF in regions.boxes:
+        # Normalize to the same "BoN" form the heuristic path emits when the read parses
+        # as one; an unparseable read votes as-is so a legible label still shows up.
+        match["best_of"] = vote([
+            parse_best_of(read["text"]) or normalize_ocr(read["text"])
+            for reads in reads_per_frame
+            if (read := reads.get(REGION_BEST_OF)) is not None and read["text"]])
+    else:
+        match["best_of"] = vote([
+            best_of["text"] for frame in match["frames"]
+            if (best_of := find_best_of(frame.get("texts", []), frame_height)) is not None])
+    return match
+
+
 # ── Character voting ───────────────────────────────────────────────────────────
 
 def attach_characters(match: Match) -> Match:
@@ -840,7 +1276,7 @@ def _row_candidates(texts: list[TextBox], frame_width: int, frame_height: int) -
     learner sees the same boxes the per-frame reader chooses among. Lockstep with the reader is
     enforced by sharing _x_gated."""
     band = [t for t in texts if bbox_center_y(t) >= frame_height * OVERLAY_BOTTOM_FRAC
-            and not is_round_text(t) and not is_numeric_text(t)
+            and not is_round_text(t) and not is_numeric_text(t) and not is_punctuation_only(t)
             and not parse_best_of(t["text"]) and not is_best_of_label(t["text"])
             and not is_ignored_tag_text(t["text"])]
     band = drop_sublabels(band)
@@ -908,6 +1344,19 @@ class TopBandStructure:
         return self.pair_frames / self.n_ocr_frames if self.n_ocr_frames else 0.0
 
 
+def top_band_pair_found(texts: list[TextBox], frame_width: int = 1920,
+                        frame_height: int = 1080) -> bool:
+    """Whether one frame's texts show a FULL gamertag pair in the top band, by the real
+    top-band reader's own judgement (find_tournament_tags, at_bottom=False, no stacked
+    handling, no learned row). A full pair is a returned list with no None slot: the reader
+    returns None or a two-element list, and a lone-tag salvage fills one slot with None
+    ([entry, None] / [None, entry]), and those single-sided reads must not count. This is the
+    per-frame "does a top overlay exist" probe measure_top_band_structure aggregates over a
+    VOD and the side-bar pre-pass (vodparse.side_overlay) asks of its sampled frames."""
+    found = find_tournament_tags(texts, frame_width=frame_width, frame_height=frame_height)
+    return found is not None and None not in found
+
+
 def measure_top_band_structure(matches: list[Match], frame_width: int,
                                frame_height: int) -> TopBandStructure | None:
     """Measure how often the TOP band shows a full gamertag pair across a VOD's matches.
@@ -942,12 +1391,7 @@ def measure_top_band_structure(matches: list[Match], frame_width: int,
             if not texts:
                 continue
             n_ocr_frames += 1
-            found = find_tournament_tags(texts, frame_width=frame_width,
-                                         frame_height=frame_height)
-            # A full pair is a returned list with no None slot. find_tournament_tags returns
-            # None or a two-element list, and a lone-tag salvage fills one slot with None
-            # ([entry, None] / [None, entry]): those single-sided reads must not count.
-            if found and None not in found:
+            if top_band_pair_found(texts, frame_width, frame_height):
                 pair_frames += 1
                 match_has_pair = True
         if match_has_pair:
@@ -1065,7 +1509,11 @@ def enrich_match(match: Match, filter_overlays: bool = True,
                  frame_width: int = 1920, frame_height: int = 1080,
                  overlay_at_bottom: bool = False, overlay_stacked: bool = False,
                  tag_row_y: float | None = None,
-                 ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT) -> Match:
+                 ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT,
+                 layout: CustomOverlayLayout | None = None,
+                 ingame_band: str = INGAME_BAND_TAGS,
+                 roster: Sequence[str] = (),
+                 overlay_regions: OverlayRegions | None = None) -> Match:
     """Vote the ingame tags and tournament overlay for a match. When `filter_overlays`
     is set, the vote sees only screen-locked overlay text (see filter_static_overlays)
     so moving in-game scenery can't be mistaken for a gamertag. `banners` (from
@@ -1077,33 +1525,78 @@ def enrich_match(match: Match, filter_overlays: bool = True,
     once per VOD, e.g. by enrich_matches, since it spans all matches). `overlay_stacked` reads
     each gamertag from the row below its location/handle metadata line. `ingame_tag_frac` widens
     the in-game nametag band for shrunk captures (see INGAME_TAG_BAND_FRAC_DEFAULT); it does not
-    touch the tournament reader. The match's stored `frames` keep their full text: only the
-    voting uses the view."""
+    touch the tournament reader. `overlay_regions` (the overlay text regions the pipeline read
+    per sample: a custom layout's drawn boxes, or the rows the side-bar pre-pass locked; see
+    vodparse.overlay_regions) replaces the tournament-overlay heuristics with votes over
+    those reads for the fields it holds (see attach_overlay_regions); regions without the
+    gamertag boxes keep the built-in tag reading, and only then do the at-bottom/stacked/row
+    knobs still apply. Left None with a `layout` given, the regions are the layout's own
+    (layout_overlay_regions), so every caller that passes only the layout reads as before.
+    `layout` itself still routes the in-game nameplate read (its drawn nameplate boxes and
+    band choice, see below). `ingame_band` says
+    what the game's own nameplate band holds (one of games.INGAME_BAND_MODES, resolved by
+    overlay_layout.ingame_band_mode_for): the players' in-game tags (voted into
+    `ingame_tags`), the characters' names (voted into `characters`, see
+    attach_band_characters, snapping to `roster` when one is given), or nothing worth
+    reading (a game that draws no nameplates there: the band is left unread rather than
+    voted on whatever else it holds). A layout that draws the nameplate boxes themselves
+    (``ingame_p1`` / ``ingame_p2``) is voted at those boxes instead of searched for in the
+    band (attach_layout_ingame), in the same mode. The match's stored `frames` keep their
+    full text: only the voting uses the view."""
+    if ingame_band not in INGAME_BAND_MODES:
+        raise ValueError(f"ingame_band must be one of {INGAME_BAND_MODES}; got {ingame_band!r}")
+    if overlay_regions is None and layout is not None:
+        overlay_regions = layout_overlay_regions(layout, frame_width, frame_height)
     raw_frames, frames = build_vote_views(match["frames"], banners, filter_overlays)
     view: Match = {**match, "frames": frames}
-    attach_ingame_tags(view, frame_width, frame_height, ingame_tag_frac=ingame_tag_frac)
-    # Pass the pre-static-filter frames so the overlay vote can recover a gamertag the filter
-    # pruned in favour of a position-locked sponsor (see _rescue_filtered_sponsor).
-    attach_tournament_overlay(view, frame_width, frame_height, at_bottom=overlay_at_bottom,
-                              stacked=overlay_stacked,
-                              raw_frames=raw_frames if filter_overlays else None,
-                              tag_row_y=tag_row_y)
+    if nameplates_from_boxes(layout, ingame_band):
+        assert layout is not None   # nameplates_from_boxes implies a layout
+        attach_layout_ingame(view, layout, ingame_band, roster=roster)
+    elif ingame_band == INGAME_BAND_TAGS:
+        attach_ingame_tags(view, frame_width, frame_height, ingame_tag_frac=ingame_tag_frac)
+    elif ingame_band == INGAME_BAND_CHARACTER:
+        attach_band_characters(view, frame_width, frame_height, ingame_tag_frac=ingame_tag_frac,
+                               roster=roster)
+    else:
+        # The same pair an unreadable band produces (attach_ingame_tags' own empty result),
+        # which every consumer already handles: no tags, and not confirmed.
+        view["ingame_tags"] = None
+        view["ingame_tags_confirmed"] = False
+    if overlay_regions is None or not overlay_regions.reads_player_boxes:
+        # The built-in reading: also what regions without the gamertag boxes keep for the
+        # tags (their other boxes override their fields below). Pass the pre-static-filter
+        # frames so the overlay vote can recover a gamertag the filter pruned in favour of a
+        # position-locked sponsor (see _rescue_filtered_sponsor).
+        attach_tournament_overlay(view, frame_width, frame_height, at_bottom=overlay_at_bottom,
+                                  stacked=overlay_stacked,
+                                  raw_frames=raw_frames if filter_overlays else None,
+                                  tag_row_y=tag_row_y)
+    if overlay_regions is not None:
+        attach_overlay_regions(view, overlay_regions, frame_height)
     match["ingame_tags"]           = view["ingame_tags"]
     match["ingame_tags_confirmed"] = view["ingame_tags_confirmed"]
     match["tournament_tags"]       = view["tournament_tags"]
     match["tournament_sponsors"]   = view["tournament_sponsors"]
     match["round"]                 = view["round"]
     match["best_of"]               = view["best_of"]
-    # Characters ride on YOLO detections, not OCR text, so the overlay/banner text
-    # filters above don't apply: vote on the raw frames.
-    attach_characters(match)
+    if ingame_band == INGAME_BAND_CHARACTER:
+        # The band vote is the character source for this game (it has no portrait detector).
+        match["characters"] = view["characters"]
+    else:
+        # Characters ride on YOLO detections, not OCR text, so the overlay/banner text
+        # filters above don't apply: vote on the raw frames.
+        attach_characters(match)
     return match
 
 
 def enrich_matches(raw: list[Match], *, filter_overlays: bool, filter_banners: bool,
                    frame_width: int, frame_height: int, overlay_at_bottom: bool = False,
                    overlay_stacked: bool = False, banners: list[tuple[str, float, float]] | None = None,
-                   ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT) -> list[Match]:
+                   ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT,
+                   layout: CustomOverlayLayout | None = None,
+                   ingame_band: str = INGAME_BAND_TAGS,
+                   roster: Sequence[str] = (),
+                   overlay_regions: OverlayRegions | None = None) -> list[Match]:
     """Vote each raw match's frames into stable tags/round/best-of, optionally stripping
     persistent stream graphics from the vote first. `overlay_at_bottom` reads the tournament
     overlay's gamertags/sponsors from the bottom of the frame instead of the top, anchored on
@@ -1114,15 +1607,25 @@ def enrich_matches(raw: list[Match], *, filter_overlays: bool, filter_banners: b
     over the same matches (the smart-tags sweep enriches the same raw matches 16 times);
     it is only consulted when `filter_banners` is set, and when left None the scan runs
     here as before. `ingame_tag_frac` widens the in-game nametag band for shrunk captures
-    (see INGAME_TAG_BAND_FRAC_DEFAULT)."""
+    (see INGAME_TAG_BAND_FRAC_DEFAULT). `overlay_regions` (the overlay text regions the
+    pipeline read per sample; None with a `layout` given means the layout's own, see
+    enrich_match) votes the overlay from those reads instead (see attach_overlay_regions);
+    when they hold the gamertag boxes the at-bottom row learning is skipped, since no
+    position is being searched for. `layout` still routes the in-game nameplate read.
+    `ingame_band` says what the game's own nameplate band holds (in-game tags, character
+    names, or nothing; see enrich_match); a run that reads no in-game tags takes its tags
+    from the tournament overlay alone. `roster` is the game's character names for the
+    character read to snap to (see games.load_roster); empty keeps the raw reads."""
     if not filter_banners:
         banners = None
     elif banners is None:
         banners = find_persistent_graphics(raw)
     if banners:
         print(f"  Persistent graphics stripped from voting: {sorted({b[0] for b in banners})}")
+    if overlay_regions is None and layout is not None:
+        overlay_regions = layout_overlay_regions(layout, frame_width, frame_height)
     tag_row_y: float | None = None
-    if overlay_at_bottom:
+    if overlay_at_bottom and (overlay_regions is None or not overlay_regions.reads_player_boxes):
         # Learn the gamertag row once across all matches; every match's vote then anchors on
         # it (see the learned-row constants block). Unlearnable VODs keep the edge anchor.
         row = learn_tag_row(raw, frame_width, frame_height)
@@ -1135,7 +1638,9 @@ def enrich_matches(raw: list[Match], *, filter_overlays: bool, filter_banners: b
     enriched = [enrich_match(m, filter_overlays=filter_overlays, banners=banners,
                              frame_width=frame_width, frame_height=frame_height,
                              overlay_at_bottom=overlay_at_bottom, overlay_stacked=overlay_stacked,
-                             tag_row_y=tag_row_y, ingame_tag_frac=ingame_tag_frac)
+                             tag_row_y=tag_row_y, ingame_tag_frac=ingame_tag_frac,
+                             layout=layout, ingame_band=ingame_band, roster=roster,
+                             overlay_regions=overlay_regions)
                 for m in raw]
     strip_constant_overlay_tags(enriched)
     return enriched

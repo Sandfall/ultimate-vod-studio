@@ -1,8 +1,9 @@
 """Cut match/set clips from a reviewed JSON (the GUI Review screen's output).
 
 The reviewed JSON holds absolute, human-corrected clip boundaries plus edited tags/characters,
-so this slices the clips and writes the metadata CSV with no buffer math. Run standalone or via
-the GUI's "Export clips" button:
+so this slices the clips and writes the metadata CSV with no buffer math. The CSV is shared by
+every VOD exported under the same tournament name: only this VOD's rows are replaced. Run
+standalone or via the GUI's "Export clips" button:
 
     python -m vodparse.cli.export_reviewed --input json_output/<stem>/reviewed.json
 
@@ -79,6 +80,8 @@ def main() -> None:
     clip_dir = video_out_dir(folder, args.out_root)
     clip_dir.mkdir(parents=True, exist_ok=True)
 
+    # The CSV may be shared with other VODs of the same tournament (see
+    # vodparse.export.merge_vod_rows): only this VOD's rows are replaced.
     export_reviewed(data, clip_dir, title_limit=args.title_limit,
                     title_filenames=args.title_filenames)
 

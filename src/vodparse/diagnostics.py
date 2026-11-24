@@ -52,7 +52,7 @@ MAX_TOTAL_UNCOMPRESSED = 50 * 1024 * 1024
 # JSON keys whose values are absolute filesystem paths. Reduced to basenames before export so
 # a shared bundle never leaks the sender's directory layout. Keyed by field name (not a blind
 # whole-tree guess) so non-path strings are never mangled.
-_PATH_KEYS = {"video_path", "timer_model_path", "character_model_path"}
+_PATH_KEYS = {"video_path", "timer_model_path", "character_model_path", "stock_model_path"}
 
 # Arcnames for the GUI crash log and its rotated sibling. Stored as .txt so ALLOWED_SUFFIXES
 # stays as tight as it is: renaming one artifact beats teaching the verifier (and so every
@@ -66,6 +66,16 @@ CRASH_LOG_ROTATED_ARCNAME = "crash_log.1.txt"
 # Paired with vodparse.gui.crash_log._MAX_LOG_BYTES, the rotation cap: same size, so a log
 # that rotated on schedule still ships in full and only a runaway one gets trimmed.
 MAX_CRASH_LOG_BYTES = 2_000_000
+
+# faulthandler (vodparse.gui.crash_log) logs every Windows exception it sees, handled or not,
+# under this alarming headline. 0x8001010d (RPC_E_CANTCALLOUT_ININPUTSYNCCALL) is one Windows
+# UI Automation raises and handles itself whenever a screen reader or an automation tool reads
+# the app's windows, so a bundled log that has it says so up front instead of reading as a crash.
+HANDLED_UIA_EXCEPTION_LINE = b"Windows fatal exception: code 0x8001010d"
+HANDLED_UIA_EXCEPTION_NOTE = (
+    b"[diagnostics] note: the 'Windows fatal exception: code 0x8001010d' entries below are not "
+    b"crashes: UI Automation (a screen reader, an automation tool) raises and handles that "
+    b"exception itself, and faulthandler logs it anyway.\n")
 
 type Json = None | bool | int | float | str | list[Json] | dict[str, Json]
 
@@ -175,7 +185,9 @@ def _crash_log_entries(crash_log: Path | None) -> list[tuple[str, bytes]]:
     Reading happens here, not in the caller, so both of this artifact's best-effort rules stay
     in one place: an oversized log is tail-capped (see ``_read_crash_log_tail``), and a log
     that disappears between the existence check and the read — the GUI or a second instance
-    rotating it — is skipped rather than failing the whole bundle over one extra."""
+    rotating it — is skipped rather than failing the whole bundle over one extra. A log with
+    UI Automation's handled exception in it opens with a note saying so (see
+    ``HANDLED_UIA_EXCEPTION_NOTE``)."""
     if crash_log is None:
         return []
     rotated = crash_log.with_suffix(crash_log.suffix + ".1")
@@ -185,9 +197,13 @@ def _crash_log_entries(crash_log: Path | None) -> list[tuple[str, bytes]]:
         if not path.is_file():
             continue
         try:
-            items.append((arcname, _read_crash_log_tail(path)))
+            contents = _read_crash_log_tail(path)
         except OSError as e:
             print(f"  diagnostics: could not read {path.name} ({e}): bundling without it")
+            continue
+        if HANDLED_UIA_EXCEPTION_LINE in contents:
+            contents = HANDLED_UIA_EXCEPTION_NOTE + contents
+        items.append((arcname, contents))
     return items
 
 
@@ -218,9 +234,12 @@ def _app_version() -> str:
 
 
 def _qt_version() -> str:
+    """The version of the Qt runtime that is loaded (qVersion), or "unavailable" without
+    PyQt6. Not QT_VERSION_STR: that is the Qt that PyQt was compiled against, which can be
+    older than the runtime a bug report is really about."""
     try:
-        from PyQt6.QtCore import QT_VERSION_STR
-        return QT_VERSION_STR
+        from PyQt6.QtCore import qVersion
+        return str(qVersion())
     except Exception:
         return "unavailable"
 

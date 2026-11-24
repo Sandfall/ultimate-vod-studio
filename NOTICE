@@ -117,10 +117,11 @@ Where that document and this one disagree, that document describes the artifact
 you have; the notes below describe the wheels this project builds against. Of
 those, only opencv-python is version-pinned by build_mac.sh /
 build_windows.ps1 — it is the one whose vendored FFmpeg has differed in LICENSE
-and not merely in version between releases (see 4).
+and not merely in version between releases (see 3).
 
   1. bin/ffmpeg(.exe) - the executable this program actually calls, staged from
-     the imageio-ffmpeg package by the build scripts.
+     the imageio-ffmpeg package by the build scripts. Only this copy ships: the
+     package itself, which carries the same binary, is left out of the bundle.
        Windows (v7.1) / Linux (v7.0.2): --enable-gpl --enable-version3
        -> GPL-3.0.
        macOS (v7.1): --enable-gpl without --enable-version3 -> GPL-2.0-or-later
@@ -128,18 +129,12 @@ and not merely in version between releases (see 4).
        the other two). FFmpeg is licensed "version 2 or later", so this copy is
        likewise usable under GPL-3.0.
 
-  2. imageio_ffmpeg/binaries/ffmpeg-* - the same upstream build as (1), carried
-     inside the imageio-ffmpeg package (the build scripts copy that very file
-     to bin/). Byte-identical on Windows; on macOS the two copies differ only
-     in the ad-hoc code signature PyInstaller applies. Same license as (1) on
-     each platform.
-
-  3. Qt's multimedia backend (avcodec, avformat, avutil, swscale, swresample),
+  2. Qt's multimedia backend (avcodec, avformat, avutil, swscale, swresample),
      used by the in-app video preview. Qt builds its own FFmpeg (n7.1.3) on
      both platforms, without --enable-gpl, so these copies are LGPL. They are
-     distinct from the OpenCV libraries in (4) despite the overlapping soname.
+     distinct from the OpenCV libraries in (3) despite the overlapping soname.
 
-  4. OpenCV's video I/O backend.
+  3. OpenCV's video I/O backend.
        Windows and Linux: OpenCV's own builds, no --enable-gpl -> LGPL-2.1,
        whose text opencv-python ships in its LICENSE-3RD-PARTY.txt.
        macOS: opencv-python's macOS wheels instead vendor a Homebrew-built

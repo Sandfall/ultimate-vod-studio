@@ -12,6 +12,16 @@ Two screens in a QStackedWidget share one subprocess log:
     then exports the clips via ``vodparse.cli.export_reviewed``.
 The subprocess stages run via QProcess so the UI stays responsive; their stdout collects into an
 off-screen buffer, viewable any time via the "Show log…" popup.
+
+Usage (from the repo root):
+
+    python -m vodparse.gui.app
+
+    # testing / GUI automation: a known starting state, settings kept apart from the user's
+    python -m vodparse.gui.app --settings-profile test --game rivals2 --video "other/vods/<vod>.mp4"
+
+    # straight to Review on a vod whose analysis exists (--debug-resume: its saved edits)
+    python -m vodparse.gui.app --debug "other/vods/<vod>.mp4"
 """
 
 import argparse
@@ -28,13 +38,12 @@ from vodparse.gui.qt_plugins import configure_qt_plugins
 configure_qt_plugins()  # must run before any PyQt6 widget module is imported
 
 from PyQt6.QtCore import (  # noqa: E402  (must follow plugin setup)
-    Qt, QProcess, QSettings, QTimer, QUrl,
+    QEvent, Qt, QPoint, QProcess, QSettings, QTimer, QUrl,
 )
 from PyQt6.QtGui import (QAction, QCloseEvent, QDesktopServices, QFont, QIcon, QKeySequence,  # noqa: E402
-                         QStandardItemModel)
+                         QScreen)
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication,
-    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -49,7 +58,6 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QRadioButton,
     QStyle,
     QToolButton,
     QVBoxLayout,
@@ -59,59 +67,84 @@ from PyQt6.QtWidgets import (  # noqa: E402
 from vodparse.gui import crash_log, windows_theme  # noqa: E402
 from vodparse.gui.commands import extract_argv, pipeline_argv  # noqa: E402
 from vodparse.gui.export_root import export_root, export_root_reachable  # noqa: E402
+from vodparse.games import (GAME_DEFAULT, GAMES, Game, default_game, ingame_band_engine_for,  # noqa: E402  (Qt-free, torch-free)
+                            game_by_id, resolve_saved_game)
+from vodparse.overlay_layout import (AUTO_LAYOUT_NAME, CustomOverlayLayout,  # noqa: E402  (Qt-free, cv2/torch-free)
+                                     ingame_band_mode_for, layout_by_name, layouts_for_game,
+                                     layouts_path, load_layouts)
 from vodparse.tags import INGAME_TAG_BAND_FRAC_DEFAULT  # noqa: E402  (cv2/torch-free)
-from vodparse.gui.common import (BusyDialog, ElidingLabel, apply_font_scale,  # noqa: E402
-                        apply_system_theme, muted_text_color, notice_color,
-                        selected_radio_value, stage_environment, warning_color)
+from vodparse.gui.common import (VIDEO_FILTER, BusyDialog, ElidingLabel,  # noqa: E402
+                        apply_font_scale, apply_system_theme, muted_text_color,
+                        notice_color, stage_environment,
+                        warning_color)
+from vodparse.gui.form_columns import FormColumns  # noqa: E402
 from vodparse.gui.dialogs import (AboutDialog, ExtractOptionsDialog, LogDialog,  # noqa: E402
                                   RereadTagsDialog, SettingsDialog, TournamentNameDialog)
 from vodparse.gui.paths import (PROJECT_ROOT, analysis_settings_differences,  # noqa: E402
                        app_icon_path, default_tournament_name, existing_analysis,
-                       existing_analysis_summary, export_csv_for, last_export_info, output_dir_for,
+                       existing_analysis_summary, last_export_info,
+                       other_vods_to_confirm, outdated_clip_files, output_dir_for,
+                       vod_clip_filenames,
                        pipeline_json_for, resolve_export_csv, review_draft_for,
                        same_physical_dir, stale_export_dir, video_metadata_mismatches,
                        vod_picker_start_dir)
 from vodparse.gui.settings import (EXTRACT_OPT_DEFAULTS, FONT_SCALE_DEFAULT,  # noqa: E402
-                          OCR_INTERVAL_CHOICES, review_mode_note, seed_tag_options,
-                          tag_reading_flags,
+                          OCR_INTERVAL_CHOICES, SMART_TAGS_FLAG, review_mode_note,
+                          seed_tag_options, tag_reading_flags,
                           OCR_ENGINE_CHOICES, OCR_ENGINE_DEFAULT_GUI, resolve_saved_engine,
                           OCR_INTERVAL_DEFAULT_SEC, OCR_LANG_DEFAULT_GUI, lang_display_name,
-                          SET_CHARACTERS_DEFAULT,
+                          EXPORT_MODE_DEFAULT, SET_CHARACTERS_DEFAULT,
                           SETTING_CONFIRM_REUSE_SETTINGS,
                           SETTING_FONT_SCALE, SETTING_GPU_SKIP_FIRST_RUN_OFFER,
-                          SETTING_DEFAULT_VOD_DIR, SETTING_GATE_OCR_ON_TIMER,
+                          SETTING_DEFAULT_VOD_DIR, SETTING_GAME, SETTING_GATE_OCR_ON_TIMER,
                           SETTING_GEOMETRY_MAIN, SETTING_GEOMETRY_REVIEW,
                           SETTING_INGAME_TAG_BAND_FRAC, SETTING_OCR_ENGINE,
                           SETTING_OCR_INTERVAL_SEC, SETTING_OCR_LANG, SETTING_OCR_ROI_CACHE,
+                          SETTING_SHOW_LAYOUT_PREVIEW, SHOW_LAYOUT_PREVIEW_DEFAULT,
+                          SETTING_ASK_CONVERT_MKV, ASK_CONVERT_MKV_DEFAULT,
+                          OVERLAY_LAYOUT_DEFAULT, overlay_layout_setting_key,
+                          GATE_OCR_ON_TIMER_DEFAULT, OCR_ROI_CACHE_DEFAULT,
                           SETTING_SHOW_DEBUG_MENU, SETTING_SHOW_FONT_STYLE_NOTE,
                           SETTING_SHOW_SMART_TAGS_POPUP,
                           SETTING_TITLE_CHAR_LIMIT,
                           SETTING_TITLE_FILENAMES_MATCHES, SETTING_TITLE_FILENAMES_SETS,
                           SITUATIONAL_EXTRACT_OPTS,
                           TITLE_CHAR_LIMIT_DEFAULT)
-from vodparse.gui.convert import Mp4Converter, opencv_can_read  # noqa: E402
+from vodparse.gui.convert import Mp4Converter, is_mp4_conversion_of, opencv_can_read  # noqa: E402
 from vodparse import gpu_support  # noqa: E402  (stdlib-only; no torch/Qt at import)
-from vodparse.gui.gpu_support import GpuSupportManager, GpuSupportDialog  # noqa: E402
+from vodparse.gui.gpu_support import (  # noqa: E402
+    GpuSupportDialog, GpuSupportManager, connect_site_swap)
 from vodparse.gui.updates import UpdateChecker  # noqa: E402
-from vodparse.ocr_engine import (DOCTR_WEIGHTS_MB_APPROX, OCR_ENGINE_DOCTR,  # noqa: E402  (stdlib-only; no torch/Qt at import)
-                                 doctr_available, doctr_weights_cached)
+from vodparse.ocr_engine import (DOCTR_NOT_INSTALLED_MESSAGE,  # noqa: E402  (stdlib-only; no torch/Qt at import)
+                                 DOCTR_WEIGHTS_MB_APPROX, FONT_STYLE_STANDARD,
+                                 FONT_STYLE_STYLIZED, OCR_ENGINE_DOCTR, doctr_available,
+                                 doctr_weights_cached)
 from vodparse.runtime_paths import is_frozen  # noqa: E402
+from vodparse.gui.clock_locate import ClockLocator  # noqa: E402
+from vodparse.gui.side_overlay_locate import SideOverlayLocator  # noqa: E402
+from vodparse.cli.side_overlay_locate import SideOverlayLocateResult  # noqa: E402
+from vodparse.prepass_handover import PrepassHandover, write_handover  # noqa: E402
 from vodparse.gui.preview import PreviewProgressPane  # noqa: E402
-from vodparse.gui.widgets import FittingStack, make_icon_button  # noqa: E402
+from vodparse.gui.widgets import (FittingStack, PopupPickComboBox,  # noqa: E402
+                                  combo_width_for_chars, make_icon_button,
+                                  widen_popup_to_fit_items)
 from vodparse.extract_flags import EXTRACT_FLAGS_NAME, read_sidecar  # noqa: E402
 from vodparse.smart_tags import SMART_TAGS_REPORT_NAME  # noqa: E402
+from vodparse.gui.review_tools import (  # noqa: E402  (Tools-menu pieces shared with the vod grabber)
+    BUSY_EXPORT_NOTE, RENAME_EXPORT_NOTE, confirm_reread_discard,
+    rename_leaves_exported_clips_behind, show_smart_tags_summary,
+)
 from vodparse.gui.review.screen import ReviewScreen  # noqa: E402  (QtMultimedia; after plugin setup)
 from vodparse.gui.upload_assistant import (  # noqa: E402  (PyQt6 widgets; after plugin setup)
     UploadAssistant, forget_saved_geometry as forget_upload_assistant_geometry)
 from vodparse.diagnostics import available_stems, default_zip_name  # noqa: E402
-from vodparse.export import (build_chapters, clip_unit, count_saved_lines,  # noqa: E402
-                             export_basename, planned_clip_filename)
-from vodparse.ffmpeg_runtime import UNPLAYABLE_CONTAINER_EXTS  # noqa: E402
+from vodparse.export import (CSV_READ_ERRORS, build_chapters, clip_unit,  # noqa: E402
+                             count_saved_lines, export_basename, planned_clip_filename)
+from vodparse.ffmpeg_runtime import offers_conversion  # noqa: E402
 from vodparse.jsonio import write_json_atomic  # noqa: E402
 from vodparse.paths import vod_stem  # noqa: E402
-from vodparse.schema import ReviewedData  # noqa: E402
-
-VIDEO_FILTER = "Videos (*.mp4 *.mov *.mkv *.avi);;All files (*)"
+from vodparse.schema import BBox, ReviewedData  # noqa: E402
+from vodparse.cli.clock_locate import ClockLocateResult  # noqa: E402  (import-light: no torch)
 
 
 def _dir_size_gb(path: Path) -> float:
@@ -122,11 +155,34 @@ def _dir_size_gb(path: Path) -> float:
     except OSError:
         return 0.0
 
+
+def _outdated_clips_tooltip(clips: list[Path]) -> str:
+    """The names a tick of the "remove outdated clips" checkbox deletes, one per line,
+    capped at OUTDATED_CLIP_TOOLTIP_NAMES with a count of the rest."""
+    names = [clip.name for clip in clips[:OUTDATED_CLIP_TOOLTIP_NAMES]]
+    rest = len(clips) - len(names)
+    if rest:
+        names.append(f"… and {rest} more")
+    return "\n".join(names)
+
+
+def _files_size_gb(paths: list[Path]) -> float:
+    """Total size of the files `paths` in GB (the same convention as _dir_size_gb); a file
+    that can't be stat'd counts as 0."""
+    total = 0
+    for path in paths:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total / 1e9
+
+
 # The signature QProcess.finished delivers: (exit_code, exit_status).
 FinishHandler = Callable[[int, QProcess.ExitStatus], None]
 
 # How long _stop_process waits for the child to exit: after the polite terminate(),
-# then after the follow-up kill().
+# then after the follow-up kill(). Windows skips the polite step (see _stop_process).
 STOP_TERM_WAIT_MS = 3000
 STOP_KILL_WAIT_MS = 1000
 
@@ -141,32 +197,105 @@ SIGINT_PUMP_INTERVAL_MS = 200
 DEFAULT_WINDOW_SIZE_MAIN = (1150, 820)     # the analysis page (stack index 0)
 DEFAULT_WINDOW_SIZE_REVIEW = (1400, 920)   # the Review page (stack index 1)
 
-# Whether the Sets box shows the "Group sets by:" source picker. Hidden for the OSS
-# release: ingame-tag grouping only works reliably as a *fallback*, so the choice stays
-# pinned to its "Auto" default for now. All the wiring (radios, note, --group-by plumbing)
-# stays live behind this flag: flip to True to restore the row once ingame grouping works.
-SHOW_GROUP_BY_CONTROLS = False
+# The narrowest the Analyze page's Preview box may get: half the page's default window
+# width. The option boxes beside it are as wide as their contents ask, so without a floor
+# a wide one (a long layout name, a large Text size) takes its extra width out of the
+# preview. With it, the window grows instead once the preview is down to this.
+PREVIEW_MIN_WIDTH_PX = DEFAULT_WINDOW_SIZE_MAIN[0] // 2
+
+# The longest name, in characters, the Overlay layout combo grows to show in full. A
+# longer one is cut short with "…" in the closed combo (its list still shows it in full).
+# Room for a typical event-and-stage name ("Genesis 9 main stage"), while one very long
+# name cannot widen the whole option column and take the width out of the preview.
+OVERLAY_LAYOUT_COMBO_MAX_CHARS = 24
+
+# The extract's --group-by value (which tags identify a set). Always "auto" from the GUI:
+# the "Group sets by:" picker was dropped because ingame-tag grouping only works reliably
+# as a *fallback*. The --group-by plumbing (commands.extract_argv, the Review mode note)
+# stays live, so a picker can return without re-threading it.
+GROUP_BY_DEFAULT = "auto"
 
 # The muted note under the main screen's "Font style:" combo, one per style: what that
 # style is good at, so the trade-off is visible without opening the info button beside it.
 # Which one shows follows the combo; both are hidden together when the user turns the note
 # off in Settings → Analysis. See _refresh_engine_note.
-FONT_STYLE_NOTE_STANDARD = ("Standard reads most plain text overlays. If you want to read "
-                            "fancier fonts (or italics), try using Stylized.")
-FONT_STYLE_NOTE_STYLIZED = "Stylized reads a wider range of fonts, but VOD analysis is slower."
+FONT_STYLE_NOTE_STANDARD = (f"{FONT_STYLE_STANDARD} reads most plain text overlays. If you want "
+                            f"to read fancier fonts (or italics), try using {FONT_STYLE_STYLIZED}.")
+FONT_STYLE_NOTE_STYLIZED = (f"{FONT_STYLE_STYLIZED} reads a wider range of fonts, but VOD analysis "
+                            "is slower.")
+# The button beside the Overlay layout combo that opens the layout editor (see
+# _on_edit_layouts). The messages that send the user to it (the game note below, the two
+# "Overlay layout …" warnings in _on_run) call it "Edit", so change them together.
+EDIT_LAYOUTS_BUTTON_TEXT = "Edit…"
+
+# Teal note under the Game combo while a game with no clock detector of its own is selected
+# (only "Other" today, by design): its run needs a custom overlay layout to supply the
+# clock, so say so before Analyze VOD is pressed. See
+# vodparse.games.Game.has_timer_model.
+GAME_NOTE_NO_TIMER_MODEL = ("{game} has no clock detector model, click \"Edit\" to make a "
+                            "layout for it.")
+
+# Shown under the Game combo (in the warning colour) when the preview's clock search for
+# the selected game found no steady clock: its detector fired on none of the sampled
+# frames, or fired only here and there (another game's clock can look enough like it,
+# e.g. Melee's under Ultimate; a VOD with little game footage among the samples can do
+# it too) without settling on one spot. The likeliest cause is a VOD of another game with
+# last session's game still selected, and the place to fix it is the combo right above,
+# which is all the note says (the user's own words, 2026-10-19: the search's reasons are
+# on the Preview box's status line already). The same doubt is raised once more on
+# Analyze (GAME_CONFIRM_NO_CLOCK), the moment the mistake would cost a long run.
+GAME_NOTE_NO_CLOCK = "Check to make sure the correct game is selected."
+GAME_CONFIRM_NO_CLOCK = ("Check to make sure the correct game is selected.\n\n"
+                         "Analyze it as {game} anyway?")
+
+# How many clip names the "remove outdated clips" checkbox lists in its tooltip before
+# summarising the rest: a re-export that retitled a whole bracket would otherwise list
+# more than fits on screen.
+OUTDATED_CLIP_TOOLTIP_NAMES = 12
+
+# The Overlay layout combo's last item, under a separator: not a choice but an action,
+# opening the layout editor straight on a new layout (see _on_overlay_layout_activated).
+# For a game with nothing else to list (no Auto, no preset yet) it is the only item, with
+# no separator, and the one current. It is told apart by a flag in its own item-data role
+# rather than by its data, since any string could also be a preset's name.
+OVERLAY_LAYOUT_NEW_ITEM = "New layout…"
+OVERLAY_LAYOUT_NEW_ROLE = Qt.ItemDataRole.UserRole + 1
+
+# Teal reminder above the main page's run buttons while the "Export as" choice in the
+# Advanced Analysis Options popup is Games rather than the default Sets: the popup is closed
+# by then, and the choice decides what Review and Export produce. The same words as the
+# popup's own note beside the radios (dialogs.EXPORT_MODE_GAMES_NOTE). See
+# _refresh_export_mode_note.
+EXPORT_MODE_GAMES_REMINDER = "Each game will be exported as its own clip."
+
+# The file a run is handed what the Preview box's searches already found in
+# (vodparse.prepass_handover), written beside the run's progress file.
+PREPASS_HANDOVER_FILE_NAME = "vodparse_prepass_handover.json"
 
 
+def _calibrated_bbox(clock: ClockLocateResult | None) -> BBox | None:
+    """The calibrated clock box of a clock search's answer; None when the search had
+    nothing to find, could not run, or found no steady spot."""
+    if clock is None or clock.error is not None:
+        return None
+    return clock.bbox
 
-def _smart_entry_text(title: str, entry: dict) -> str:
-    """One smart-tags report entry ("Picked"/"Runner-up") for the summary popup: the flag
-    label plus each scorer's value ("-" for the no-tags variance sentinel, stored as null),
-    plus the heavy-fallback promotion reason on a winner the correction moved to the front."""
-    scores = ", ".join(f"{name} {value:g}" if isinstance(value, (int, float)) else f"{name} -"
-                       for name, value in entry["scores"].items())
-    text = f"{title}: {entry['label']}\n{scores}"
-    if entry.get("promotion"):
-        text += f"\n{entry['promotion']}"
-    return text
+
+def _gpu_offer_preview_applies() -> bool:
+    """Whether the Debug menu carries "Run first-run GPU offer…". Not on macOS: the Apple
+    GPU is used automatically there, so the offer can only end in its "No compatible NVIDIA
+    GPU … on the CPU" notice, which contradicts Settings' "Using: Apple GPU (Metal/MPS)"."""
+    return sys.platform != "darwin"
+
+
+def _colour_note(label: QLabel, colour: str, *, bold: bool = False) -> None:
+    """Give one of the main window's notes its theme colour (``colour`` is a
+    muted_text_color / notice_color / warning_color value, resolved against the current
+    palette). The one place the notes' style sheet is written: each note's creation site
+    and MainWindow._restyle_themed_notes (a light/dark switch) both go through it, so a
+    note's look can't drift between the two."""
+    weight = " font-weight: bold;" if bold else ""
+    label.setStyleSheet(f"color: {colour};{weight}")
 
 
 class MainWindow(QWidget):
@@ -189,27 +318,48 @@ class MainWindow(QWidget):
         # The now-superseded previous export folder, captured at export kickoff (a tournament
         # rename moves the export elsewhere); offered for deletion in _on_export_finished.
         self._stale_export_dir: Path | None = None
+        # This VOD's clip filenames in the target CSV before the export replaced its rows,
+        # captured at the same kickoff: the files a re-export no longer lists are offered
+        # for removal in _on_export_finished (see gui.paths.outdated_clip_files).
+        self._previous_clip_names: frozenset[str] = frozenset()
         # The export root captured at the same kickoff, so the in-flight export's folder,
         # the stale-folder vetting above, and the post-export delete guard all agree even
         # if the paths/export_dir setting changes mid-export.
         self._export_root: Path | None = None
         self._stopping = False  # set while a user-requested Stop is in flight; the child exit is deliberate
+        self._shutting_down = False  # the window is quitting: start no background work
         self._extract_was_smart = False  # whether the in-flight extract ran --smart-tags; set at kickoff
 
         # Persistent app settings (see SettingsDialog); QSettings keys off the org/app names set in
         # main(), so values survive restarts on every platform.
         self._settings = QSettings()
 
-        # Advanced extract flags, edited via the Advanced Extract Options popup (see ExtractOptionsDialog). Seeded
+        # Advanced extract flags, edited via the Advanced Analysis Options popup (see ExtractOptionsDialog). Seeded
         # from their last-used values (persisted in QSettings), falling back to EXTRACT_OPT_DEFAULTS.
         self._extract_opts = self._load_extract_opts()
 
-        # Embedded pipeline preview + progress bar: the chosen video's first frame, swapped for
-        # the pipeline's live annotated frames (plus a progress bar/ETA) while a run is active.
-        # See preview.py for the file-polling scheme.
+        # Embedded layout preview + progress bar: the chosen video scrubbed with the selected
+        # overlay layout's read regions drawn on the frame, swapped for the pipeline's live
+        # annotated frames (plus a progress bar/ETA) while a run is active. See preview.py
+        # for the file-polling scheme and layout_preview.py for the scrubber.
         self._preview_pane = PreviewProgressPane(self._settings)
+        # The preview's clock search (see clock_locate.py): one answer per video and game,
+        # from a saved analysis or a torch sidecar process. Asked by _refresh_layout_preview
+        # whenever the video, game or layout choice changes; its answers land in the pane.
+        self._clock_locator = ClockLocator(self)
+        # (video path, game id) pairs the user agreed to analyze although the clock search
+        # found no steady clock (_confirm_no_clock), so the question is asked once per pair.
+        self._no_clock_confirmed: set[tuple[str, str]] = set()
+        self._clock_locator.searching.connect(self._preview_pane.set_clock_status)
+        self._clock_locator.located.connect(self._on_clock_located)
+        # The preview's player-name search (see side_overlay_locate.py), for a game whose
+        # names sit in bars beside the picture: asked once the clock has answered (the
+        # bars are placed from its box), by _request_side_overlay.
+        self._side_overlay_locator = SideOverlayLocator(self)
+        self._side_overlay_locator.searching.connect(self._on_side_overlay_searching)
+        self._side_overlay_locator.located.connect(self._preview_pane.set_side_overlay)
 
-        # MKV/AVI → MP4 conversion offers (see convert.py): whatever file the user ends up
+        # MKV/AVI/WebM → MP4 conversion offers (see convert.py): whatever file the user ends up
         # with: converted, reused, or the source as-is: is adopted like any picked file.
         self._converter = Mp4Converter(self)
         self._converter.fileReady.connect(self._finish_selection)
@@ -220,6 +370,12 @@ class MainWindow(QWidget):
         self._gpu = GpuSupportManager(self)
         self._gpu.declined.connect(self._suppress_gpu_first_run_offer)
         self._gpu.no_gpu_found.connect(self._suppress_gpu_first_run_offer)
+        # The preview's OCR helper imports torch, and once GPU support is installed that is the
+        # CUDA build, whose folder an install or uninstall (from any manager, Settings' included)
+        # must rename or delete: the helper stops and holds its reads until that is over, as
+        # Windows refuses while it holds the DLLs.
+        connect_site_swap(self._preview_pane.release_for_site_swap,
+                          self._preview_pane.read_after_site_swap)
         # Drives Help ▸ Check for Updates (compares __version__ against the latest GitHub
         # Release off the UI thread). Manual only: no automatic phone-home on launch.
         self._updates = UpdateChecker(self)
@@ -280,18 +436,15 @@ class MainWindow(QWidget):
         # so a page can't be dragged small enough to overlap its own controls; but it's capped to
         # the screen so a tall page still fits a small display. Applied after the first layout
         # settles (see main) and on every page switch.
-        # The screen currently on top, so a page switch (and close) knows which screen's geometry
-        # to save. The window starts on the analysis page.
-        self._active_screen = 0
-        # On a page switch, swap in that screen's own remembered window geometry (and clamp it
-        # back on-screen: entering Review grows the minimum, which can push it past the edge).
+        # A page switch (_show_page) swaps in that page's own remembered window geometry;
+        # what follows the visible page itself is updated on currentChanged.
         self._stack.currentChanged.connect(self._on_screen_changed)
         self._update_title(self._stack.currentIndex())
         # currentChanged doesn't fire at construction, so seed the Tools surfaces' visibility for
         # the starting page (Analyze) explicitly: both surfaces exist now (_build_title_row ran).
         self._apply_tools_visibility(self._stack.currentIndex())
         self._refresh_nav()
-        self._update_groupby_enabled()
+        self._refresh_export_mode_note()  # surface a Games export mode persisted from a past session
         self._refresh_opts_warning()   # surface a situational toggle persisted from a past session
         # Offer the GPU download once, after the window is up (0-delay = "once the event loop runs").
         QTimer.singleShot(0, self._maybe_offer_gpu_on_first_run)
@@ -306,16 +459,35 @@ class MainWindow(QWidget):
         geometry to restore (first launch, restore off, after a layout reset)."""
         return DEFAULT_WINDOW_SIZE_REVIEW if index == 1 else DEFAULT_WINDOW_SIZE_MAIN
 
-    def _on_screen_changed(self, new_index: int) -> None:
-        """On a page switch, stash the geometry of the screen we're leaving and restore the one
-        we're entering (if it has a remembered size yet), then clamp on-screen."""
-        # The Review-only Tools surfaces follow the visible page (set before the early-return so a
-        # redundant signal still leaves them in the right state).
-        self._apply_tools_visibility(new_index)
-        if new_index == self._active_screen:
+    def _show_page(self, index: int) -> None:
+        """Switch the stack to page ``index`` (0 Analyze, 1 Review), swapping the window's
+        geometry with it: stash the size of the page being left, switch, then restore the
+        entering page's own size (_restore_page_geometry). Every page switch goes through
+        here.
+
+        The stash has to come before the switch. When the entering page needs more height
+        than the window has, the stack grows the window inside setCurrentIndex, before
+        currentChanged reaches any slot; stashed after that, the Analyze page's size would be
+        Review's minimum height, and Back would bring the Analyze page back that tall (VM
+        screenshot round, 2026-10-27)."""
+        leaving = self._stack.currentIndex()
+        if index == leaving:
             return
-        self._settings.setValue(self._geometry_key(self._active_screen), self.saveGeometry())
-        self._active_screen = new_index
+        self._settings.setValue(self._geometry_key(leaving), self.saveGeometry())
+        self._stack.setCurrentIndex(index)
+        self._restore_page_geometry(index)
+
+    def _on_screen_changed(self, new_index: int) -> None:
+        """What follows the visible page: the Review-only Tools surfaces, and on entering
+        Review the export-output buttons. The window geometry is _show_page's."""
+        self._apply_tools_visibility(new_index)
+        if new_index == 1:  # entering Review: light up the export-output buttons by what's on disk
+            self._refresh_export_outputs()
+
+    def _restore_page_geometry(self, new_index: int) -> None:
+        """Restore the window geometry page ``new_index`` last had (or its default size the
+        first time), floored at its content minimum and clamped on-screen. Called by
+        _show_page once the stack shows that page."""
         # Re-floor the window for the screen we're entering BEFORE restoring its geometry:
         # minimumSizeHint() already reflects the new page. If we restored first, a wider screen's
         # leftover minimum (e.g. Review's ~1116) would clamp a narrower screen's restored width and
@@ -323,7 +495,14 @@ class MainWindow(QWidget):
         self._apply_min_size()
         saved = self._settings.value(self._geometry_key(new_index))
         if saved:
-            if not self.restoreGeometry(saved):
+            # The saved geometry carries the page's last position too, which can be on
+            # another display (Review last used on an external monitor): the page keeps its
+            # remembered size but stays on the display the window is on now.
+            screen_before = self.screen()
+            top_left_before = self.frameGeometry().topLeft()
+            if self.restoreGeometry(saved):
+                self._keep_on_screen(screen_before, top_left_before)
+            else:
                 # Saved rect no longer lands on any available screen (e.g. an external
                 # monitor was unplugged since the last save): fall back to the default
                 # size. No centering here — the deferred _fit_to_screen below already
@@ -336,8 +515,22 @@ class MainWindow(QWidget):
             self.resize(*self._default_size(new_index))
         # else: geometry restore is off — keep the current, manually-sized window as-is.
         QTimer.singleShot(0, self._fit_to_screen)
-        if new_index == 1:  # entering Review: light up the export-output buttons by what's on disk
-            self._refresh_export_outputs()
+
+    def _keep_on_screen(self, screen: QScreen | None, top_left: QPoint) -> None:
+        """After a page switch restored that page's saved geometry: when the restored window
+        sits mostly off ``screen`` (the display the window was on before the switch), move it
+        back to ``top_left``, where it was, keeping the restored size. A restored maximized or
+        full-screen state is cleared first: a window manager ignores move() on such a window,
+        so it would stay on the other display. The deferred _fit_to_screen then trims anything
+        that overhangs that display's edges. (For a top-level widget pos() already includes
+        the frame, so ``top_left``, taken from frameGeometry(), is what move() wants.)"""
+        if screen is None:
+            return
+        if screen.availableGeometry().contains(self.frameGeometry().center()):
+            return
+        if self.isMaximized() or self.isFullScreen():
+            self.setWindowState(Qt.WindowState.WindowNoState)
+        self.move(top_left)
 
     def _apply_min_size(self) -> None:
         """Set the window minimum to the current page's natural content minimum, so the page
@@ -419,7 +612,7 @@ class MainWindow(QWidget):
         else:
             forget_upload_assistant_geometry(self._settings)
         self._apply_min_size()
-        self.resize(*self._default_size(self._active_screen))
+        self.resize(*self._default_size(self._stack.currentIndex()))
         self._center_on_screen()
         QTimer.singleShot(0, self._fit_to_screen)
 
@@ -440,6 +633,17 @@ class MainWindow(QWidget):
         prefs.triggered.connect(self._open_settings)
         file_menu.addAction(prefs)
 
+        # A conversion the user asks for, for a chosen video that loads but won't show (a
+        # black picture gives the app nothing to notice, so there is no automatic offer for
+        # it). Enable-gated like the export action below: Analyze page only, with a video
+        # chosen and no run in progress (see _refresh_convert_action). NoRole keeps it in
+        # this menu on macOS.
+        self._convert_action = QAction("Convert to MP4…", self)
+        self._convert_action.setMenuRole(QAction.MenuRole.NoRole)
+        self._convert_action.setEnabled(False)  # no video is chosen yet
+        self._convert_action.triggered.connect(self._on_convert_to_mp4)
+        file_menu.addAction(self._convert_action)
+
         # The Review tree's single-clip export (same as its right-click action), on the current
         # selection. Unlike the Tools/Edit menus, File is visible on every page, so this action
         # is enable-gated instead of hidden: Review page only, and not during a subprocess run
@@ -457,10 +661,10 @@ class MainWindow(QWidget):
         # One-click route to the (standalone) Upload Assistant: no need to walk through
         # analyze/review/export first; it opens empty and its Open… button picks an export
         # CSV. NoRole keeps it in this menu on macOS.
-        assistant = QAction("Upload Assistant…", self)
-        assistant.setMenuRole(QAction.MenuRole.NoRole)
-        assistant.triggered.connect(self._show_upload_assistant)
-        file_menu.addAction(assistant)
+        self._assistant_action = QAction("Upload Assistant…", self)
+        self._assistant_action.setMenuRole(QAction.MenuRole.NoRole)
+        self._assistant_action.triggered.connect(self._show_upload_assistant)
+        file_menu.addAction(self._assistant_action)
 
         # Compute status + (on Windows) the GPU-acceleration download. Reachable here and in
         # Settings → General; both open the same status panel. NoRole keeps it in this menu on macOS.
@@ -520,11 +724,13 @@ class MainWindow(QWidget):
         # Runs the real first-run flow ("Checking for GPU…" → offer / no-GPU notice) without
         # the installed/skip-flag guards, so it can be previewed on any build. It exercises
         # the shipped behavior for real: a no-GPU result persists the skip flag and "Don't ask
-        # again" is honored; on a source checkout it ends in offer_install's pip hint.
-        first_run_gpu = QAction("Run first-run GPU offer…", self)
-        first_run_gpu.setMenuRole(QAction.MenuRole.NoRole)
-        first_run_gpu.triggered.connect(self._gpu.check_then_offer)
-        menu.addAction(first_run_gpu)
+        # again" is honored; on a source checkout it ends in offer_install's pip hint. Left
+        # out on macOS (see _gpu_offer_preview_applies), where there is nothing to offer.
+        if _gpu_offer_preview_applies():
+            first_run_gpu = QAction("Run first-run GPU offer…", self)
+            first_run_gpu.setMenuRole(QAction.MenuRole.NoRole)
+            first_run_gpu.triggered.connect(self._gpu.check_then_offer)
+            menu.addAction(first_run_gpu)
 
         # A persisted checkable toggle for the smart-tag pick popup shown after a --smart-tags
         # run / re-read. Off by default: the full ranking always goes to the log (Show log…);
@@ -622,6 +828,23 @@ class MainWindow(QWidget):
         self._refresh_lang_note()                 # reflect a just-changed overlay language on the main screen
         self._refresh_engine_note()               # show/hide the font style note per the toggle
         self._apply_debug_menu_visibility()       # show/hide the Debug menu per the toggle
+        self._apply_layout_preview_setting()      # layout preview or first-frame still per the toggle
+        # "Reset all preferences" clears the game key and the per-game layout keys; rebuilding
+        # the Game combo re-reads both, since restoring a game refills the layout combo.
+        self._populate_game_combo()
+
+    def _apply_layout_preview_setting(self) -> None:
+        """Settings closed: switch the Preview box to the look the toggle names (see
+        _show_layout_preview). Off stops both searches first, since the box no longer shows
+        answers, and takes the wrong-game doubt down with the note refresh; on previews the
+        chosen video again and asks for its clock (_refresh_layout_preview, which a freshly
+        built layout preview needs; a no-op without a video, and off it asks nothing)."""
+        if not self._show_layout_preview():
+            self._clock_locator.cancel()
+            self._side_overlay_locator.cancel()
+        self._preview_pane.apply_layout_preview_setting()
+        self._refresh_layout_preview()
+        self._refresh_game_note()
 
     def _show_about(self) -> None:
         """Open the About box (Help menu, or the macOS application menu via AboutRole)."""
@@ -677,6 +900,7 @@ class MainWindow(QWidget):
                 action.setVisible(visible)
         self._tools_btn.setVisible(visible)
         self._refresh_export_selected_action()
+        self._refresh_convert_action()
 
     def _refresh_export_selected_action(self) -> None:
         """Enable File → "Export selected set/game to a file…" only where it can act: on the
@@ -686,6 +910,24 @@ class MainWindow(QWidget):
         switches and run-state flips) so the two gates can't stomp each other's setEnabled."""
         self._export_selected_action.setEnabled(
             self._stack.currentIndex() == 1 and not self._running)
+
+    def _refresh_convert_action(self) -> None:
+        """Enable File → "Convert to MP4…" only where it can act: on the Analyze page
+        (index 0), with a video chosen and no subprocess running. Re-run on page switches,
+        run-state flips and whenever the chosen video changes (_refresh_nav), as one
+        combined check, like _refresh_export_selected_action. A conversion already in
+        progress needs no gate here: its progress dialog is modal over this window, and
+        Mp4Converter.convert_on_request ignores a second request anyway."""
+        self._convert_action.setEnabled(
+            self._stack.currentIndex() == 0 and self._video_path is not None
+            and not self._running)
+
+    def _on_convert_to_mp4(self) -> None:
+        """File → "Convert to MP4…": convert the chosen video on request. The converter's
+        fileReady lands in _finish_selection, so the MP4 becomes the chosen video and the
+        Preview reloads once the conversion is done; cancelling leaves the selection alone."""
+        if self._video_path is not None:
+            self._converter.convert_on_request(self._video_path)
 
     def _relabel_export_selected_action(self) -> None:
         """Match the File export action's label to the loaded review's unit: "Export
@@ -714,6 +956,21 @@ class MainWindow(QWidget):
         menu bar (default False: hidden until enabled). The gear button is always the way into
         Preferences, so it's reachable to turn this back on."""
         return self._settings.value(SETTING_SHOW_DEBUG_MENU, False, type=bool)
+
+    def _ask_convert_mkv(self) -> bool:
+        """Whether choosing an .mkv brings up the "convert to MP4" offer where the player
+        shows an MKV directly (Windows; default False). Other platforms always make the
+        offer and don't consult this (see ffmpeg_runtime.offers_conversion)."""
+        return self._settings.value(
+            SETTING_ASK_CONVERT_MKV, ASK_CONVERT_MKV_DEFAULT, type=bool)
+
+    def _show_layout_preview(self) -> bool:
+        """Whether the Preview box is the layout preview, with its clock and player-name
+        searches (default True). Off, the box shows a still of the chosen video's first
+        frame (the first release's look) and this window asks no search and uses no answer:
+        no wrong-game doubt, nothing handed to the run, which does its own pre-passes."""
+        return self._settings.value(
+            SETTING_SHOW_LAYOUT_PREVIEW, SHOW_LAYOUT_PREVIEW_DEFAULT, type=bool)
 
     def _show_smart_tags_popup(self) -> bool:
         """Whether the smart-tag pick popup appears after a --smart-tags run or re-read
@@ -760,7 +1017,7 @@ class MainWindow(QWidget):
         # the color re-resolves here (not at construction) to track a light/dark theme flip.
         note = self._review_mode_note() if index == 1 else ""
         self._title_note.setText(f"({note})")
-        self._title_note.setStyleSheet(f"color: {muted_text_color()};")
+        _colour_note(self._title_note, muted_text_color())
         self._title_note.setVisible(bool(note))
 
     def _build_title_row(self) -> QHBoxLayout:
@@ -817,15 +1074,20 @@ class MainWindow(QWidget):
     def _build_main_page(self) -> QWidget:
         """The single entry screen: pick a vod, set analysis/set-grouping options, then run the
         analyze→extract chain (or reuse a prior analysis / resume saved edits). Controls are grouped
-        into Source / Analysis / Sets boxes beside the live preview pane; each box (and the action
-        row and status rows) is assembled by its own builder below."""
+        into Source / Game / Analysis boxes beside the live preview pane; each box (and the
+        action row and status rows) is assembled by its own builder below."""
         page = QWidget()
-        source_box   = self._build_source_box()
-        analysis_box = self._build_analysis_box()
-        sets_box     = self._build_sets_box()
+        # The three boxes lay their rows on one shared set of columns (see form_columns), so
+        # their labels, fields and info buttons line up from box to box.
+        form_columns = FormColumns()
+        source_box   = self._build_source_box(form_columns)
+        game_box     = self._build_game_box(form_columns)
+        analysis_box = self._build_analysis_box(form_columns)
+        form_columns.align()   # once every box's rows are in
         action_row   = self._build_action_row()
         self._build_status_rows()
         preview_col_widget = self._preview_pane
+        preview_col_widget.setMinimumWidth(PREVIEW_MIN_WIDTH_PX)
 
         # Left column: the option boxes stacked, with a trailing stretch that pins them to the top.
         # It's wrapped in a real widget (not a bare sub-layout) so QHBoxLayout lets it *expand* to
@@ -835,8 +1097,8 @@ class MainWindow(QWidget):
         controls = QVBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
         controls.addWidget(source_box)
+        controls.addWidget(game_box)
         controls.addWidget(analysis_box)
-        controls.addWidget(sets_box)
         controls.addStretch(1)
         controls_col = QWidget()
         controls_col.setLayout(controls)
@@ -848,22 +1110,23 @@ class MainWindow(QWidget):
 
         layout = QVBoxLayout(page)
         layout.addLayout(top_row, stretch=1)
+        layout.addWidget(self._export_mode_note)
         layout.addWidget(self._opts_warning_row)
         layout.addWidget(self._existing_analysis_label)
         layout.addLayout(action_row)
         return page
 
-    def _build_source_box(self) -> QGroupBox:
-        """Source: pick the vod and name the tournament."""
-        choose_btn = QPushButton("Choose video…")
-        choose_btn.clicked.connect(self._on_choose)
+    def _build_source_box(self, form_columns: FormColumns) -> QGroupBox:
+        """Source: pick the vod and name the tournament. Its rows go on `form_columns`,
+        the columns the Game and Analysis boxes share with it."""
+        # Kept on self: a run locks it (see _set_running), since the run's later stages
+        # read the chosen video when they start.
+        self._choose_btn = QPushButton("Choose video…")
+        self._choose_btn.clicked.connect(self._on_choose)
         # ElideMiddle + a 22-char floor: long filenames elide in the middle (extension stays
         # visible) without widening the Source column and squeezing the preview pane beside it.
         self._file_label = ElidingLabel("No video selected",
                                         mode=Qt.TextElideMode.ElideMiddle, min_chars=22)
-        file_row = QHBoxLayout()
-        file_row.addWidget(choose_btn)
-        file_row.addWidget(self._file_label, stretch=1)
 
         # Prefixed to every clip title ("<tournament> <round> - A vs B"). Seeded from the vod's
         # filename when a video is chosen (see _on_choose); edits stick for that video. The
@@ -871,18 +1134,88 @@ class MainWindow(QWidget):
         # field reads as blank: not "omitted from titles": before there's anything to analyze.
         self._tournament_edit = QLineEdit()
         self._tournament_prefilled_for: str | None = None
-        tournament_row = QHBoxLayout()
-        tournament_row.addWidget(QLabel("Tournament name:"))
-        tournament_row.addWidget(self._tournament_edit, 1)
 
         source_box = QGroupBox("Source")
-        source_layout = QVBoxLayout(source_box)
-        source_layout.addLayout(file_row)
-        source_layout.addLayout(tournament_row)
+        source_grid = form_columns.new_grid(source_box)
+        # The button sits in the label column, so the file name beside it starts where the
+        # fields of every other row start.
+        form_columns.add_row(source_grid, 0, self._choose_btn, self._file_label)
+        form_columns.add_row(source_grid, 1, QLabel("Tournament name:"), self._tournament_edit)
         return source_box
 
-    def _build_analysis_box(self) -> QGroupBox:
-        """Analysis: how the pipeline scans the vod."""
+    def _build_game_box(self, form_columns: FormColumns) -> QGroupBox:
+        """Game: which game the vod is of, and the overlay layout it is read through. Both
+        choices are per game (the layout list is rebuilt whenever the game changes), which is
+        why they share a box apart from the Analysis options below them. Its rows go on
+        `form_columns`, the columns the Source and Analysis boxes share with it."""
+        # Teal note shown while a game with no clock detector of its own is selected, so its
+        # need for an overlay layout is visible before Analyze VOD is pressed. Mirrors the
+        # Analysis box's _lang_note style. Built before the combo: the populate at the end of
+        # this method already refreshes it (see _refresh_game_note).
+        self._game_note = QLabel()
+        _colour_note(self._game_note, notice_color())  # teal, theme-aware
+        self._game_note.setWordWrap(True)
+        self._game_note.setVisible(False)
+
+        # Which game the VOD is of (vodparse.games): it picks the detectors the pipeline
+        # loads, the clock length the split assumes, and which overlay-layout presets the
+        # combo below it offers. Restored from QSettings by _populate_game_combo and
+        # persisted on change. Populated at the end of this method rather than here, because
+        # selecting a game rebuilds the Overlay layout combo, which does not exist yet.
+        self._game_combo = QComboBox()
+        game_info_btn = self._make_info_button(
+            "About games",
+            "Select the game you are analyzing. If your game is not listed here, you can "
+            "select \"Other\" and make a custom overlay for it.")
+
+        # Custom overlay layout: which saved preset (if any) the pipeline reads player tags,
+        # round, best-of and the match clock from, instead of the built-in overlay heuristics.
+        # A per-VOD choice, so it lives here rather than in Settings. Its contents depend on the
+        # Game combo above (only that game's presets, and "Auto" only when the game has a clock
+        # detector), so it too is populated at the end of this method, through the Game combo.
+        # A PopupPickComboBox: its "New layout…" action item opens the editor only on a pick
+        # in the popup (see _on_overlay_layout_activated).
+        self._overlay_layout_combo = PopupPickComboBox()
+        # Presets are named in the editor, so the combo grows to fit a longer name, but only
+        # as far as OVERLAY_LAYOUT_COMBO_MAX_CHARS: past that the closed combo cuts the name
+        # short with "…" instead of widening the whole column and squeezing the preview.
+        self._overlay_layout_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._overlay_layout_combo.setMaximumWidth(
+            combo_width_for_chars(self._overlay_layout_combo, OVERLAY_LAYOUT_COMBO_MAX_CHARS))
+        layout_info_btn = self._make_info_button(
+            "About overlay layouts",
+            "Define a custom layout for reading player tags and the timer. Do this if you "
+            "have a particularly difficult overlay that isn't being read by \"Auto\".")
+
+        # Opens the layout editor on the combo's choice (see _on_edit_layouts). It sits
+        # right beside the combo, in the Overlay layout row, so its short name needs no
+        # "layouts" to say what it edits.
+        edit_layouts_btn = QPushButton(EDIT_LAYOUTS_BUTTON_TEXT)
+        edit_layouts_btn.clicked.connect(self._on_edit_layouts)
+
+        game_box = QGroupBox("Game")
+        game_grid = form_columns.new_grid(game_box)
+        form_columns.add_row(game_grid, 0, QLabel("Game:"), self._game_combo,
+                             info=game_info_btn)
+        form_columns.add_full_width(game_grid, 1, self._game_note)
+        form_columns.add_row(game_grid, 2, QLabel("Overlay layout:"), self._overlay_layout_combo,
+                             side_button=edit_layouts_btn, info=layout_info_btn)
+        # The Game and Overlay layout combos are populated here, together and in this order:
+        # restoring the saved game runs _on_game_selected, which refreshes the game note and
+        # fills the layout combo for that game. Each handler is connected only after its combo
+        # has been restored (the order the Analysis box's _ocr_engine_combo uses too), so
+        # restoring never counts as a change.
+        self._populate_game_combo()
+        self._game_combo.currentIndexChanged.connect(self._on_game_selected)
+        self._overlay_layout_combo.currentIndexChanged.connect(self._on_overlay_layout_selected)
+        self._overlay_layout_combo.activated.connect(self._on_overlay_layout_activated)
+        return game_box
+
+    def _build_analysis_box(self, form_columns: FormColumns) -> QGroupBox:
+        """Analysis: how the pipeline scans the vod (text cadence, font style), plus the
+        Advanced Analysis Options button for the extract's rarer knobs ("Export as" sets or
+        games, tag reading, set characters, debug tables). Its rows go on `form_columns`,
+        the columns the Source and Game boxes share with it."""
         # How often OCR fires (and, in seek mode, how far each step jumps). Restores the last-used
         # cadence from QSettings; the seconds for each choice ride along as item data.
         self._ocr_interval_combo = QComboBox()
@@ -893,139 +1226,75 @@ class MainWindow(QWidget):
         saved_idx = self._ocr_interval_combo.findData(saved_interval)
         self._ocr_interval_combo.setCurrentIndex(saved_idx if saved_idx >= 0 else
                                                  self._ocr_interval_combo.findData(OCR_INTERVAL_DEFAULT_SEC))
-        ocr_row = QHBoxLayout()
-        ocr_row.addWidget(QLabel("Detect Text:"))
-        ocr_row.addWidget(self._ocr_interval_combo)
-        ocr_row.addStretch(1)
-        ocr_row.addWidget(self._make_info_button(
+        ocr_info_btn = self._make_info_button(
             "About analysis",
-            "How often the analyzer models detect tags, characters, the timer, etc.\n\n"
-            "Shorter intervals are more accurate, but the analysis is slower."))
+            "How often the video is checked for tags, characters and the clock.\n\n"
+            "Shorter intervals are more accurate, but slower.")
 
         # Which engine reads the overlay text (see vodparse.ocr_engine). docTR ships with
-        # the app, but stay robust to an environment without it: its item is greyed out
-        # when the package isn't importable, and resolve_saved_engine keeps a stale saved
-        # choice from preselecting it then. The selection handler offers the one-time model
-        # download (a no-op when the frozen bundle carries the models): connected after
-        # the restore below, so merely restoring a saved docTR choice never pops the offer.
+        # the app; in an environment without it Stylized stays listed, selectable and
+        # selected when saved, marked "not installed": choosing it, the Preview and
+        # Analyze VOD then say what's missing, and nothing reads with Standard in its place.
+        # The selection handler offers the one-time model download (a no-op when the frozen
+        # bundle carries the models): connected after the restore below, so merely
+        # restoring a saved docTR choice never pops the offer.
         self._ocr_engine_combo = QComboBox()
         for label, engine_id in OCR_ENGINE_CHOICES.items():
             self._ocr_engine_combo.addItem(label, engine_id)
         if not doctr_available():
             doctr_idx = self._ocr_engine_combo.findData(OCR_ENGINE_DOCTR)
-            engine_model = self._ocr_engine_combo.model()
-            assert isinstance(engine_model, QStandardItemModel)  # QComboBox's default model
-            doctr_item = engine_model.item(doctr_idx)
-            if doctr_item is not None:
-                doctr_item.setEnabled(False)
             self._ocr_engine_combo.setItemText(
                 doctr_idx, self._ocr_engine_combo.itemText(doctr_idx) + ": not installed")
         saved_engine = self._settings.value(SETTING_OCR_ENGINE, OCR_ENGINE_DEFAULT_GUI, type=str)
         self._ocr_engine_combo.setCurrentIndex(self._ocr_engine_combo.findData(
-            resolve_saved_engine(saved_engine, doctr_available())))
+            resolve_saved_engine(saved_engine)))
         self._ocr_engine_combo.currentIndexChanged.connect(self._on_ocr_engine_selected)
         self._ocr_engine_combo.currentIndexChanged.connect(self._refresh_engine_note)
-        engine_row = QHBoxLayout()
-        engine_row.addWidget(QLabel("Font style:"))
-        engine_row.addWidget(self._ocr_engine_combo)
-        engine_row.addStretch(1)
         # Standard is EasyOCR; Stylized is docTR (PARSeq), which reads English/Latin only and
         # downloads its models (~DOCTR_WEIGHTS_MB_APPROX MB) once if missing. The match clock is
         # always read with EasyOCR, regardless of this choice.
-        engine_row.addWidget(self._make_info_button(
+        engine_info_btn = self._make_info_button(
             "About font styles",
-            "How onscreen text is read.\n\nStandard is faster and works with most overlays.\n\n"
-            "Stylized is slower but works with \"fancy\" fonts (italics, comic sans, etc.).\n\n"
-            "If it looks like you're missing text when using Standard, try Stylized."))
+            f"How the text on screen is read.\n\n{FONT_STYLE_STANDARD} is faster and works "
+            f"with most overlays. {FONT_STYLE_STYLIZED} is slower but handles \"fancy\" fonts "
+            f"(italics, comic sans and so on).\n\nIf {FONT_STYLE_STANDARD} causes the program "
+            f"to miss text, try {FONT_STYLE_STYLIZED}.")
 
         # Muted note describing whichever font style is selected (see FONT_STYLE_NOTE_*): an
-        # aside rather than something that needs acting on, so it stays quieter than the teal
-        # _sets_note / _lang_note.
+        # aside rather than something that needs acting on, so it stays quieter than the
+        # _game_note / _lang_note (teal; the game note turns amber for the wrong-game doubt).
         self._engine_note = QLabel()
-        self._engine_note.setStyleSheet(f"color: {muted_text_color()};")  # grey, theme-aware
+        _colour_note(self._engine_note, muted_text_color())  # grey, theme-aware
         self._engine_note.setWordWrap(True)
         self._engine_note.setVisible(False)
 
         # Teal note naming the overlay language, shown only while a non-default (non-English)
         # one is selected in Preferences → Analysis. _refresh_lang_note reflects a saved choice
-        # here and a change applied via the Settings dialog. Mirrors _sets_note's style.
+        # here and a change applied via the Settings dialog. Mirrors _game_note's teal style.
         self._lang_note = QLabel()
-        self._lang_note.setStyleSheet(f"color: {notice_color()};")  # teal, theme-aware
+        _colour_note(self._lang_note, notice_color())  # teal, theme-aware
         self._lang_note.setWordWrap(True)
         self._lang_note.setVisible(False)
 
+        # The extract's rarer knobs live in a popup (see ExtractOptionsDialog), read back from
+        # self._extract_opts by _selected_mode / _selected_set_characters. Kept on self: a run
+        # locks it (see _set_running). It takes the whole last row of the box, as wide as
+        # the box itself.
+        self._options_btn = QPushButton("Advanced Analysis Options…")
+        self._options_btn.clicked.connect(self._edit_extract_options)
+
         analysis_box = QGroupBox("Analysis")
-        analysis_layout = QVBoxLayout(analysis_box)
-        analysis_layout.addLayout(ocr_row)
-        analysis_layout.addLayout(engine_row)
-        analysis_layout.addWidget(self._engine_note)
-        analysis_layout.addWidget(self._lang_note)
+        analysis_grid = form_columns.new_grid(analysis_box)
+        form_columns.add_row(analysis_grid, 0, QLabel("Detect Text:"), self._ocr_interval_combo,
+                             info=ocr_info_btn)
+        form_columns.add_row(analysis_grid, 1, QLabel("Font style:"), self._ocr_engine_combo,
+                             info=engine_info_btn)
+        form_columns.add_full_width(analysis_grid, 2, self._engine_note)  # under its own combo
+        form_columns.add_full_width(analysis_grid, 3, self._lang_note)
+        form_columns.add_full_width(analysis_grid, 4, self._options_btn)
         self._refresh_engine_note()  # reflect the restored font style on first build
         self._refresh_lang_note()    # reflect a restored non-English overlay language on first build
         return analysis_box
-
-    def _build_sets_box(self) -> QGroupBox:
-        """Sets: how matches group into exported sets."""
-        self._match_radio = QRadioButton("Games")
-        self._set_radio = QRadioButton("Sets")
-        self._set_radio.setChecked(True)  # mirrors extract_matches default (tournament_set)
-        self._mode_choice = QButtonGroup(self)
-        self._mode_choice.addButton(self._match_radio)
-        self._mode_choice.addButton(self._set_radio)
-        self._set_radio.toggled.connect(self._update_groupby_enabled)
-        choice_row = QHBoxLayout()
-        choice_row.addWidget(QLabel("Export as:"))
-        choice_row.addWidget(self._set_radio)
-        choice_row.addWidget(self._match_radio)
-        choice_row.addStretch(1)
-
-        # Maps each label to the extract_matches --group-by value.
-        self._groupby_radios = {
-            "auto": QRadioButton("Auto"),
-            "overlay": QRadioButton("Stream overlays"),
-            "ingame": QRadioButton("Ingame tags"),
-        }
-        self._groupby_radios["auto"].setChecked(True)  # preserve current auto behavior
-        self._groupby_choice = QButtonGroup(self)
-        self._groupby_label = QLabel("Group sets by:")
-        groupby_row = QHBoxLayout()
-        groupby_row.addWidget(self._groupby_label)
-        for radio in self._groupby_radios.values():
-            self._groupby_choice.addButton(radio)
-            groupby_row.addWidget(radio)
-        groupby_row.addStretch(1)
-
-        # Teal note shown while a non-default choice here is active (Game mode or ingame-tag
-        # grouping): both change what gets exported, so the selection shouldn't go unnoticed.
-        # Notice color, deliberately calmer than _opts_warning's bold amber "⚠".
-        self._sets_note = QLabel()
-        self._sets_note.setStyleSheet(f"color: {notice_color()};")  # teal, theme-aware
-        self._sets_note.setWordWrap(True)
-        self._sets_note.setVisible(False)
-        self._match_radio.toggled.connect(self._refresh_sets_note)
-        self._groupby_radios["ingame"].toggled.connect(self._refresh_sets_note)
-
-        # "Set characters" (--set-characters) lives in the Advanced Extract Options popup (see ExtractOptionsDialog);
-        # _selected_set_characters reads it from self._extract_opts.
-        self._options_btn = QPushButton("Advanced Extract Options…")
-        self._options_btn.clicked.connect(self._edit_extract_options)
-        options_row = QHBoxLayout()
-        options_row.addStretch(1)
-        options_row.addWidget(self._options_btn)
-
-        sets_box = QGroupBox("Sets")
-        sets_layout = QVBoxLayout(sets_box)
-        sets_layout.addLayout(choice_row)
-        if SHOW_GROUP_BY_CONTROLS:
-            sets_layout.addLayout(groupby_row)
-        else:
-            # The row stays out of the UI, so the never-shown radios keep their "Auto"
-            # default and _selected_group_by() always resolves to "auto".
-            for widget in (self._groupby_label, *self._groupby_radios.values()):
-                widget.setVisible(False)
-        sets_layout.addWidget(self._sets_note)
-        sets_layout.addLayout(options_row)
-        return sets_box
 
     def _build_action_row(self) -> QHBoxLayout:
         """The run buttons: Analyze VOD runs pipeline→extract→Review; the second button reopens
@@ -1055,13 +1324,20 @@ class MainWindow(QWidget):
         return action_row
 
     def _build_status_rows(self) -> None:
-        """The two rows that sit just above the run buttons: the situational-options warning
-        and the saved-analysis note. Both start hidden; _refresh_nav / the extract handlers
-        toggle them."""
+        """The rows that sit just above the run buttons: the Games export-mode reminder, the
+        situational-options warning and the saved-analysis note. All start hidden;
+        _refresh_export_mode_note / _refresh_opts_warning / _refresh_nav toggle them."""
+        # Shown while the popup's Export as choice is Games (see EXPORT_MODE_GAMES_REMINDER).
+        # Notice color: the choice is deliberate, so calmer than the amber warning below it.
+        self._export_mode_note = QLabel(EXPORT_MODE_GAMES_REMINDER)
+        _colour_note(self._export_mode_note, notice_color())  # teal, theme-aware
+        self._export_mode_note.setWordWrap(True)
+        self._export_mode_note.setVisible(False)
+
         # Appears only when a situational extract toggle (see SITUATIONAL_EXTRACT_OPTS) is
         # left on, so it can't silently carry into the next VOD.
         self._opts_warning = QLabel()
-        self._opts_warning.setStyleSheet(f"color: {warning_color()}; font-weight: bold;")  # amber, theme-aware
+        _colour_note(self._opts_warning, warning_color(), bold=True)  # amber, theme-aware
         self._opts_warning_clear = QPushButton("Clear")
         self._opts_warning_clear.clicked.connect(self._clear_situational_opts)
         warning_layout = QHBoxLayout()
@@ -1164,7 +1440,11 @@ class MainWindow(QWidget):
         saved = existing_analysis(video)
         differences = [] if saved is None else analysis_settings_differences(
             saved, ocr_engine=self._ocr_engine_combo.currentData(),
-            ocr_lang=self._settings.value(SETTING_OCR_LANG, OCR_LANG_DEFAULT_GUI, type=str))
+            ocr_lang=self._settings.value(SETTING_OCR_LANG, OCR_LANG_DEFAULT_GUI, type=str),
+            # "New layout…" (data None) is not a layout choice, so compare as Auto:
+            # reusing an analysis reads the layout it recorded, not the combo.
+            overlay_layout=self._overlay_layout_combo.currentData() or "",
+            game=self._game_combo.currentData())
         if differences and not self._reuse_warning_ok(
                 title="Analysis settings changed",
                 text=f"{Path(video).name} was analyzed with different settings. "
@@ -1189,7 +1469,8 @@ class MainWindow(QWidget):
     def _goto_main(self) -> None:
         """Return to the main page (e.g. Review's Back button)."""
         self._refresh_nav()  # the Resume-edits button depends on a draft existing for this vod
-        self._stack.setCurrentIndex(0)
+        self._show_page(0)
+        self._request_clock()  # an Analyze run held the Preview box's clock search
 
     def _refresh_nav(self) -> None:
         """Enable the action buttons based on whether a video is chosen and its artifacts exist.
@@ -1206,47 +1487,44 @@ class MainWindow(QWidget):
         if video is not None and has_analysis:
             self._existing_analysis_label.setText(existing_analysis_summary(video))
         self._existing_analysis_label.setVisible(has_analysis)
+        self._refresh_convert_action()   # it needs a chosen video too
 
     def _set_running(self, running: bool) -> None:
-        """Disable the action buttons during a subprocess run; restore them after."""
+        """Disable the action buttons during a subprocess run; restore them after.
+        Choose video… is one of them: the extract stage and the Review load that follow
+        the pipeline read the chosen video when they start, so a video picked mid-run
+        would be extracted and loaded in place of the one being analyzed."""
         self._running = running
-        for btn in (self._analyze_btn, self._resume_btn, self._options_btn):
+        for btn in (self._choose_btn, self._analyze_btn, self._resume_btn, self._options_btn):
             btn.setEnabled(not running)
         # Reread tags also kicks off a subprocess, so lock its Tools action during a run.
         self._reread_action.setEnabled(not running)
+        # The Upload Assistant rewrites the whole export CSV on a tournament rename, and an
+        # export running underneath it rewrites the same file when it finishes: whichever
+        # writes last wins, silently. Lock the menu entry while an export runs (the Review
+        # screen's own Upload button is locked separately, see set_upload_available).
+        self._assistant_action.setEnabled(not (running and self._exporting))
         self._refresh_export_selected_action()  # also Review-only; see the combined check
+        self._refresh_convert_action()          # Analyze-only; the same combined check
         self._stop_btn.setEnabled(running)  # inverse of the action buttons
         if not running:
             self._refresh_nav()  # reuse/resume buttons depend on artifacts existing
 
-    # ── Set-grouping control state ─────────────────────────────────────────────
-    def _update_groupby_enabled(self) -> None:
-        """Set-grouping source only applies when exporting sets, not individual matches.
-        (Set characters is likewise set-only but lives in the Advanced Extract Options popup now.)"""
-        enabled = self._set_radio.isChecked()
-        self._groupby_label.setEnabled(enabled)
-        for radio in self._groupby_radios.values():
-            radio.setEnabled(enabled)
-
-    def _refresh_sets_note(self) -> None:
-        """Show/hide the amber note under the Sets controls naming the non-default choice in
-        effect: Game mode, or ingame-tag grouping (only mentioned in Set mode: Game mode greys
-        the group-by radios out, so their value doesn't apply)."""
-        if self._match_radio.isChecked():
-            note = "Each game will be exported as its own clip (instead of grouping them into sets)"
-        elif self._groupby_radios["ingame"].isChecked():
-            note = "Sets will be grouped by the ingame tags instead of the stream overlay."
-        else:
-            note = ""
-        self._sets_note.setText(note)
-        self._sets_note.setVisible(bool(note))
+    # ── Export-mode state ──────────────────────────────────────────────────────
+    def _selected_mode(self) -> Literal["match", "tournament_set"]:
+        """The --mode value chosen as "Export as" in the Advanced Analysis Options popup
+        (defaults to whole sets)."""
+        if self._extract_opts.get("export_mode", EXPORT_MODE_DEFAULT) == "match":
+            return "match"
+        return "tournament_set"
 
     def _selected_group_by(self) -> str:
-        """The --group-by value for the checked source radio (defaults to 'auto')."""
-        return selected_radio_value(self._groupby_radios, "auto")
+        """The --group-by value the extract and Review run with: always GROUP_BY_DEFAULT
+        now that the picker is gone (see that constant)."""
+        return GROUP_BY_DEFAULT
 
     def _selected_set_characters(self) -> str:
-        """The --set-characters value chosen in the Advanced Extract Options popup (defaults to 'join')."""
+        """The --set-characters value chosen in the Advanced Analysis Options popup (defaults to 'join')."""
         return self._extract_opts.get("set_characters", SET_CHARACTERS_DEFAULT)
 
     def _edit_extract_options(self) -> None:
@@ -1254,20 +1532,28 @@ class MainWindow(QWidget):
         chosen flags so they're remembered as the defaults next time (and next launch)."""
         if ExtractOptionsDialog(self._extract_opts, self).exec() == QDialog.DialogCode.Accepted:
             self._save_extract_opts()
+            self._refresh_export_mode_note()
             self._refresh_opts_warning()
 
     def _load_extract_opts(self) -> dict:
         """Last-used extract options flags from QSettings, defaulting to EXTRACT_OPT_DEFAULTS
-        (plus the string set_characters, tracked separately from the booleans)."""
+        (plus the strings set_characters and export_mode, tracked separately from the booleans)."""
         opts = {key: self._settings.value(f"extract/opt_{key}", default, type=bool)
                 for key, default in EXTRACT_OPT_DEFAULTS.items()}
         opts["set_characters"] = self._settings.value(
             "extract/opt_set_characters", SET_CHARACTERS_DEFAULT, type=str)
+        opts["export_mode"] = self._settings.value(
+            "extract/opt_export_mode", EXPORT_MODE_DEFAULT, type=str)
         return opts
 
     def _save_extract_opts(self) -> None:
         for key, value in self._extract_opts.items():
             self._settings.setValue(f"extract/opt_{key}", value)
+
+    def _refresh_export_mode_note(self) -> None:
+        """Show the Games reminder above the run buttons only while the popup's Export as
+        choice is Games (see EXPORT_MODE_GAMES_REMINDER)."""
+        self._export_mode_note.setVisible(self._selected_mode() == "match")
 
     def _refresh_opts_warning(self) -> None:
         """Show/hide the run-time warning naming any situational extract toggle that differs from
@@ -1314,7 +1600,15 @@ class MainWindow(QWidget):
         )
         if not path:
             return
-        if Path(path).suffix.lower() in UNPLAYABLE_CONTAINER_EXTS:
+        self.choose_video(path)
+
+    def choose_video(self, path: str) -> None:
+        """Take ``path`` as the chosen video, exactly as Choose video… does once its dialog
+        returns: a container the player can't open is offered for conversion (as is an MKV
+        on Windows, once the offer is turned on in Settings), a file the analyzer can't
+        decode for re-encoding, anything else is adopted at once. Public for the ``--video``
+        launch option, which skips the dialog."""
+        if offers_conversion(path, ask_for_mkv=self._ask_convert_mkv()):
             self._converter.offer_convert(path)   # finishes the selection via fileReady once resolved
         elif not opencv_can_read(path):
             # Fail at selection time instead of minutes into a run: the pipeline reads frames
@@ -1326,11 +1620,26 @@ class MainWindow(QWidget):
             self._finish_selection(path)
 
     def _finish_selection(self, path: str) -> None:
-        """Adopt `path` as the current vod and refresh the Main page for it."""
+        """Adopt `path` as the current vod and refresh the Main page for it. Refused
+        while a run is in flight (see _set_running): Choose video… is locked then, but
+        an MP4 conversion started before the run can still finish during it.
+
+        The MP4 made from the current vod (File → "Convert to MP4…", or a conversion
+        offer for the same file chosen again) is the same VOD, so the tournament name
+        seeded or typed for it carries over rather than being reseeded from the new
+        file name."""
+        if self._running:
+            self._append(f"\n> {Path(path).name} is ready, but a run is in progress. "
+                         "Choose it again once the run ends.")
+            return
+        current = self._video_path
+        if (current is not None and self._tournament_prefilled_for == current
+                and is_mp4_conversion_of(path, current)):
+            self._tournament_prefilled_for = path   # _seed_tournament_name keeps the text
         self._video_path = path
         self._file_label.setText(Path(path).name)
         self._seed_tournament_name()  # once per vod; survives a later return from Review
-        self._preview_pane.set_video(self._video_path)
+        self._load_video_into_preview(path)
         self._refresh_nav()
 
     def _confirm_overwrite_analysis(self) -> bool:
@@ -1354,31 +1663,38 @@ class MainWindow(QWidget):
         return reply == QMessageBox.StandardButton.Yes
 
     def _confirm_reread_discard(self) -> bool:
-        """Confirm discarding Review edits before a Re-read tags regeneration. Prompts when there
-        are edits to lose: either live edits not yet flushed to the draft (has_unsaved_edits) or a
-        saved draft on disk: with re-read wording; returns True to proceed. Nothing to lose means
-        no prompt and True. The plain draft-file check alone would miss edits made inside the
-        debounced-save window, so the live-edit check is needed too."""
+        """Confirm discarding Review edits before a Re-read tags regeneration (the shared
+        review_tools.confirm_reread_discard: asks only when there are edits to lose)."""
         video = self._video_path
         if video is None:
             return False
-        if not self._review.has_unsaved_edits() and not review_draft_for(video).exists():
-            return True
-        reply = QMessageBox.question(
-            self, "Reread tags?",
-            f"Rereading the tags for {Path(video).name} regenerates its games and discards your "
-            "current Review edits. Continue?",
-        )
-        return reply == QMessageBox.StandardButton.Yes
+        return confirm_reread_discard(self, self._review, vod_stem(video), Path(video).name)
 
     def _on_ocr_engine_selected(self) -> None:
-        """The Text-engine combo changed: choosing docTR before its models are downloaded
-        offers the one-time download right away rather than surprising the user at Run.
-        Declining, cancelling, or a failed download reverts the combo to EasyOCR so the
-        choice never silently points at an engine that can't read anything yet."""
-        if self._ocr_engine_combo.currentData() != OCR_ENGINE_DOCTR or doctr_weights_cached():
+        """The Text-engine combo changed: the Preview box reads with the new choice at
+        once (the setting itself is saved only at Run). Choosing docTR without its package
+        says how to install it; choosing it before its models are downloaded offers the
+        one-time download right away rather than surprising the user at Run. Either way
+        the combo stays on Stylized: until docTR can read, the Preview says why it can't
+        and Analyze VOD asks again, but nothing reads with Standard in its place."""
+        self._preview_pane.set_engine(self._ocr_engine_combo.currentData())
+        self._request_side_overlay()   # the rows are found with the Font style's engine
+        if self._ocr_engine_combo.currentData() != OCR_ENGINE_DOCTR:
             return
-        self._offer_doctr_fetch(lambda ok: None if ok else self._revert_text_engine())
+        if not doctr_available():
+            QMessageBox.warning(self, f"{FONT_STYLE_STYLIZED} isn't installed",
+                                DOCTR_NOT_INSTALLED_MESSAGE)
+            return
+        if not doctr_weights_cached():
+            self._offer_doctr_fetch(self._on_doctr_offer_done)
+
+    def _on_doctr_offer_done(self, downloaded: bool) -> None:
+        """The download offered on choosing docTR ended: a completed one hands the choice
+        to the Preview box again now that it can read with it. A declined, cancelled or
+        failed one changes nothing (see _on_ocr_engine_selected's docstring)."""
+        if downloaded:
+            self._preview_pane.set_engine(self._ocr_engine_combo.currentData())
+            self._request_side_overlay()
 
     def _refresh_engine_note(self) -> None:
         """Describe the selected font style in the muted note under the combo, unless the notes
@@ -1400,10 +1716,442 @@ class MainWindow(QWidget):
         self._lang_note.setText("" if is_default else f"The overlay language is set to {label}.")
         self._lang_note.setVisible(not is_default)
 
-    def _revert_text_engine(self) -> None:
-        """Put the Text-engine combo back on the default (EasyOCR)."""
-        self._ocr_engine_combo.setCurrentIndex(
-            self._ocr_engine_combo.findData(OCR_ENGINE_DEFAULT_GUI))
+    def changeEvent(self, a0: QEvent | None) -> None:
+        """Follow a live light/dark switch. Qt re-colours ordinary widgets from the new
+        palette by itself, but the notes restyled here carry an explicit colour in a style
+        sheet, resolved when it was set; without this a light-to-dark switch leaves the font
+        style note in light mode's dark grey on the dark background."""
+        if a0 is not None and a0.type() == QEvent.Type.PaletteChange:
+            self._restyle_themed_notes()
+        super().changeEvent(a0)
+
+    def _restyle_themed_notes(self) -> None:
+        """Re-resolve every main-window note's theme colour (muted grey, notice teal, warning
+        amber) against the current palette. Safe to repeat: setting an unchanged style sheet
+        on a child label sends no PaletteChange back to this window."""
+        # A PaletteChange can arrive while __init__ is still building the pages; the title
+        # note is the last of these labels to exist, so until then there is nothing to do.
+        if getattr(self, "_title_note", None) is None:
+            return
+        self._update_title(self._stack.currentIndex())   # the title note re-resolves there
+        _colour_note(self._engine_note, muted_text_color())
+        _colour_note(self._lang_note, notice_color())
+        _colour_note(self._export_mode_note, notice_color())
+        _colour_note(self._opts_warning, warning_color(), bold=True)
+        self._refresh_game_note()   # notice or warning colour, by what the note says
+
+    def _selected_game(self) -> Game:
+        """The registry entry for the Game combo's current selection. The combo only ever
+        holds registry ids (see _populate_game_combo), so the default is unreachable in
+        practice; it keeps the callers below total rather than Optional."""
+        return game_by_id(self._game_combo.currentData()) or default_game()
+
+    def _add_overlay_layout_new_item(self) -> None:
+        """Append the OVERLAY_LAYOUT_NEW_ITEM action item to the Overlay layout combo,
+        flagged in OVERLAY_LAYOUT_NEW_ROLE, under a separator when there are choices above
+        it. Its data is ``None``, so the rebuild's restore (findData of a saved name) never
+        lands on it, and _on_run stops on it when it is all a game has; picking it opens
+        the editor instead of becoming the selection.
+
+        With nothing above it (a game with no Auto and no preset yet) it gets no
+        separator: it is then item 0, the item every fallback to the first item lands on."""
+        combo = self._overlay_layout_combo
+        if combo.count() > 0:
+            combo.insertSeparator(combo.count())
+        combo.addItem(OVERLAY_LAYOUT_NEW_ITEM, None)
+        combo.setItemData(combo.count() - 1, True, OVERLAY_LAYOUT_NEW_ROLE)
+
+    def _populate_overlay_layout_combo(self) -> None:
+        """(Re)build the Overlay layout combo for the game the Game combo currently shows:
+        "Auto" (item data ``""``, meaning the built-in overlay reading) followed by one item
+        per saved preset of that game, name as both text and data, then a separator and the
+        "New layout…" action item (see _add_overlay_layout_new_item).
+
+        Auto is offered only when the game ships a clock detector (every game but Other
+        today), since the built-in reading has no other clock source; a game without one
+        that has no preset yet therefore has nothing to list at all, and shows "New
+        layout…" as its only item, current. Called on first build, whenever the Game combo
+        changes, after the editor closes (a preset may have been added/renamed/deleted) and
+        after the Settings dialog closes ("Reset all preferences" clears the keys).
+
+        The selection to restore is always read from that game's own QSettings key
+        (overlay_layout_setting_key): the key is the single source of truth, written on every
+        change by _on_overlay_layout_selected, and one key per game means switching games and
+        back restores each game's own choice. A saved name that is no longer in the list (the
+        preset was deleted, or it was saved for another game) falls back to the first item —
+        Auto, else the first preset, else "New layout…" — and the write-back at the end
+        records that fallback so the key and the combo never disagree; after Reset-all this
+        recreates the key with "" on purpose. Signals are blocked while rebuilding because
+        QComboBox.clear() emits currentIndexChanged(-1), which would otherwise persist None
+        over the user's choice mid-repopulate."""
+        game = self._selected_game()
+        saved = self._settings.value(
+            overlay_layout_setting_key(game.id), OVERLAY_LAYOUT_DEFAULT, type=str)
+        combo = self._overlay_layout_combo
+        combo.blockSignals(True)
+        combo.clear()
+        if game.has_timer_model:
+            combo.addItem(AUTO_LAYOUT_NAME, OVERLAY_LAYOUT_DEFAULT)
+        for layout in layouts_for_game(load_layouts(layouts_path()), game.id):
+            combo.addItem(layout.name, layout.name)
+        self._add_overlay_layout_new_item()
+        # The closed combo cuts a very long name short (see OVERLAY_LAYOUT_COMBO_MAX_CHARS);
+        # its list shows every name in full.
+        widen_popup_to_fit_items(combo)
+        idx = combo.findData(saved)
+        # Item 0: Auto, else the first preset, else "New layout…" (then the only item).
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        self._on_overlay_layout_selected()  # write back a deleted-preset fallback (key == combo)
+
+    def _on_overlay_layout_selected(self) -> None:
+        """Persist the Overlay layout choice for the selected game as soon as it changes.
+        Unlike the cadence and font-style combos (written in _on_run), this value is also read
+        by the reuse-analysis warning and cleared by "Reset all preferences", and the Settings
+        dialog used to persist it on OK; writing on change keeps every reader on one value.
+
+        "New layout…" (data ``None``) is never written: it is not a choice. While it is a
+        game's only item (no Auto, no preset yet) it is simply what the combo shows, and the
+        game keeps whatever it had saved, ready for the moment a preset for it exists.
+
+        Where there are choices above it, landing on "New layout…" is either a pick in the
+        popup, which _on_overlay_layout_activated (connected to ``activated``, emitted right
+        after this) answers by opening the editor, or an arrow key, the mouse wheel or
+        type-ahead on the closed combo (Qt skips the separator above it). That is not a
+        request for the editor, so the combo goes back to the game's saved choice instead."""
+        combo = self._overlay_layout_combo
+        on_new_layout = bool(combo.currentData(OVERLAY_LAYOUT_NEW_ROLE))
+        new_layout_is_the_only_item = combo.count() == 1
+        if on_new_layout and not new_layout_is_the_only_item:
+            if not combo.picked_from_popup():
+                self._restore_overlay_layout_choice()
+            return
+        choice = combo.currentData()
+        if choice is not None:
+            self._settings.setValue(overlay_layout_setting_key(self._selected_game().id), choice)
+        # Every path that changes what the run would read with ends here: a layout pick, a
+        # game change, the editor closing and a Settings reset all funnel through
+        # _populate_overlay_layout_combo, which calls this last.
+        self._refresh_layout_preview()
+
+    def _on_overlay_layout_activated(self, index: int) -> None:
+        """Open the layout editor on a new layout when "New layout…" is picked in the
+        Overlay layout combo's popup. Connected to ``activated``, which Qt emits after every
+        pick in the popup, also of the item already current: that is how a game whose only
+        item is "New layout…" (no Auto, no preset yet) opens the editor at all, since
+        picking the current item changes no index. Only a pick in the popup counts
+        (picked_from_popup): ``activated`` also follows an arrow key, the wheel or
+        type-ahead, and those never open the editor.
+
+        Picking it writes nothing: the combo is rebuilt when the editor closes (see
+        _open_layout_editor), showing the layout saved there, else the game's previous
+        choice again ("New layout…" itself for a game that still has nothing else)."""
+        combo = self._overlay_layout_combo
+        if combo.itemData(index, OVERLAY_LAYOUT_NEW_ROLE) and combo.picked_from_popup():
+            self._open_layout_editor(initial_layout=None)
+
+    def _restore_overlay_layout_choice(self) -> None:
+        """Put the Overlay layout combo back on the selected game's saved choice (the key
+        _on_overlay_layout_selected writes on every real change), silently: nothing about
+        what the run reads with has changed. A saved name no longer listed falls back to
+        the first item, as in _populate_overlay_layout_combo."""
+        combo = self._overlay_layout_combo
+        saved = self._settings.value(
+            overlay_layout_setting_key(self._selected_game().id), OVERLAY_LAYOUT_DEFAULT, type=str)
+        idx = combo.findData(saved)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _load_video_into_preview(self, path: str) -> None:
+        """Open the newly chosen ``path`` in the Preview box and ask for its clock. The
+        clock search is cancelled first: the preview forgets its clock on every set_video,
+        so a request for the pair already asked for (the same video chosen again) must be
+        delivered again (from the cache, or searched afresh after a failure) rather than
+        skipped as a repeat. The note under the Game combo is refreshed too: a wrong-game
+        doubt raised for the previous video says nothing about this one."""
+        self._clock_locator.cancel()
+        self._side_overlay_locator.cancel()
+        self._preview_pane.set_video(path)
+        self._refresh_layout_preview()
+        self._refresh_game_note()
+
+    def _refresh_layout_preview(self) -> None:
+        """Tell the Preview box what the run would read with (the selected game, the
+        selected overlay layout resolved to its preset, the in-game band widening, the
+        Font style) and ask
+        the clock search for the video's clock under that game (not while a run is in
+        flight, see _request_clock). A no-op until a video is chosen; _finish_selection
+        calls it once there is one. "New layout…" as a game's only item (no layout to
+        choose) previews like Auto: the run itself refuses to start there.
+
+        The preset is resolved the way _on_run resolves it (a name no longer in the store
+        reads as no layout; _on_run says so when the run is started)."""
+        if self._video_path is None:
+            return
+        game = self._selected_game()
+        layout = self._selected_layout()
+        ingame_tag_frac = self._settings.value(
+            SETTING_INGAME_TAG_BAND_FRAC, INGAME_TAG_BAND_FRAC_DEFAULT, type=float)
+        self._preview_pane.set_engine(self._ocr_engine_combo.currentData())
+        self._preview_pane.set_context(game, layout, ingame_tag_frac)
+        self._request_clock()
+
+    def _request_clock(self) -> None:
+        """Ask the clock search for the chosen video's clock under the selected game. A
+        no-op with no video, while a run is in flight, off the main page, while the
+        window quits, and while the layout preview is turned off in Settings (the box
+        shows a still then, see _show_layout_preview). A pipeline run cancels the search
+        (no torch sidecar competing with
+        it), and it is asked for again where the Preview box comes back into view: a failed
+        or stopped run, or a Review that failed to load, leaves the main page showing
+        (_on_pipeline_finished, _on_extract_finished, _consume_stop), and a finished one
+        goes to Review, whose Back button returns here (_goto_main). Asking at the end of
+        every run instead would start a torch search while Review loads."""
+        video = self._video_path
+        if (video is None or self._running or self._shutting_down
+                or self._stack.currentIndex() != 0   # 0: the main page
+                or not self._show_layout_preview()):
+            return
+        self._clock_locator.request(video, self._selected_game())
+        self._request_side_overlay()
+
+    def _selected_layout(self) -> CustomOverlayLayout | None:
+        """The Overlay layout choice resolved to its preset: None for Auto, for "New
+        layout…" (a game's only item while it has no preset), and for a name no longer in
+        the store."""
+        layout_name = self._overlay_layout_combo.currentData()
+        return layout_by_name(load_layouts(layouts_path()), layout_name) if layout_name else None
+
+    def _preview_ocr(self) -> tuple[str, str]:
+        """The OCR engine and language the Preview box's searches read with: the Font style
+        choice as it stands (a search refuses, saying why, while docTR can't read yet) and
+        the saved overlay language."""
+        engine = self._ocr_engine_combo.currentData()
+        lang = self._settings.value(SETTING_OCR_LANG, OCR_LANG_DEFAULT_GUI, type=str)
+        return engine, lang
+
+    def _on_clock_located(self, result: ClockLocateResult | None) -> None:
+        """The clock search answered: hand the answer to the Preview box, refresh the note
+        under the Game combo (no steady clock raises the wrong-game doubt there),
+        then ask for the player-name rows, whose bars are placed from the clock's box."""
+        self._preview_pane.set_clock(result)
+        self._refresh_game_note()
+        self._request_side_overlay()
+
+    def _wrong_game_suspected(self) -> bool:
+        """Whether the clock search for the chosen video and game has answered that it
+        found no steady clock: the detector fired on none of its sampled frames, or fired
+        but calibration refused a box (the hits disagreed, or there were too few to trust:
+        what another game's clock tends to produce, and what a VOD with little game
+        footage among the samples can produce too, so the question this raises is only a
+        confirm). Those are the outcomes that point at the wrong game being selected. A
+        search still running, a failed one (weights missing), a game without a detector,
+        and a steady clock that could not be read are all False: those say something else.
+        So is the layout preview being off: an answer found while it was on is not used
+        (see _show_layout_preview)."""
+        video = self._video_path
+        if video is None or not self._show_layout_preview():
+            return False
+        game = self._selected_game()
+        if not game.has_timer_model:
+            return False
+        answered, clock = self._clock_locator.answer_for(video, game)
+        if not answered or clock is None or clock.error is not None:
+            return False
+        never_fired = clock.first_hit_sec is None
+        fired_without_a_steady_spot = clock.bbox is None
+        return never_fired or fired_without_a_steady_spot
+
+    def _confirm_no_clock(self) -> bool:
+        """Ask whether to analyze as the selected game although no steady clock of it was
+        found (GAME_CONFIRM_NO_CLOCK); True to go ahead. A Yes is remembered for this
+        video and game for the session: the doubt stands until the search finds a clock,
+        and a run that failed or was stopped should not raise the same question again."""
+        assert self._video_path is not None   # _on_run returns before this without a video
+        key = (self._video_path, self._selected_game().id)
+        if key in self._no_clock_confirmed:
+            return True
+        reply = QMessageBox.question(
+            self, "Wrong game?",
+            GAME_CONFIRM_NO_CLOCK.format(game=self._selected_game().display_name),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+        self._no_clock_confirmed.add(key)
+        return True
+
+    def _request_side_overlay(self) -> None:
+        """Ask the player-name search for the rows an Auto run would lock on the chosen
+        video (see side_overlay_locate.py). A no-op in the situations _request_clock is,
+        and until the clock search has answered for this video and game (its answer
+        arrives through _on_clock_located, which asks again). Where the search does not
+        apply (a game with no side bars, or a custom overlay layout, whose own boxes say
+        where the names are) one in flight is stopped and its progress text taken off
+        the Preview box (a cancelled search answers nothing, so nothing else would);
+        the box ignores the rows there itself."""
+        video = self._video_path
+        if (video is None or self._running or self._shutting_down
+                or self._stack.currentIndex() != 0   # 0: the main page
+                or not self._show_layout_preview()):
+            return
+        game = self._selected_game()
+        if not game.has_side_bars or self._selected_layout() is not None:
+            if self._side_overlay_locator.cancel():
+                self._preview_pane.set_side_overlay_status("")
+            return
+        answered, clock = self._clock_locator.answer_for(video, game)
+        if not answered:
+            return
+        if clock is not None and clock.error is None and clock.first_hit_sec is None:
+            # The clock detector fired on none of the clock search's frames. The name search
+            # reads only frames with a clock, so it would read its frames for nothing:
+            # answer for it instead (the run skips its pre-pass the same way), with nothing
+            # to add to the clock search's own "No clock was found" on the status line.
+            self._side_overlay_locator.cancel()
+            self._preview_pane.set_side_overlay(SideOverlayLocateResult.not_searched())
+            return
+        engine, lang = self._preview_ocr()
+        self._side_overlay_locator.request(video, game, engine, lang, _calibrated_bbox(clock))
+
+    def _on_side_overlay_searching(self, text: str) -> None:
+        """A player-name search is running: whatever rows the Preview box drew were found
+        for something else (another Font style, another clock box), so they are dropped
+        while the progress text shows."""
+        self._preview_pane.set_side_overlay(None)
+        self._preview_pane.set_side_overlay_status(text)
+
+    def _write_prepass_handover(self, video: str, game: Game, ocr_engine: str, ocr_lang: str,
+                                layout: CustomOverlayLayout | None) -> Path | None:
+        """Write what the Preview box's searches already found for this run (the calibrated
+        clock, the player-name rows) to the handover file, and return its path for the
+        pipeline argv; None when there is nothing to hand over or the file could not be
+        written, and the run then searches for itself (see vodparse.prepass_handover). The
+        rows are looked up under the run's own Font style and language, so rows found
+        with another engine are never handed over. Nor is anything with the layout
+        preview off: an answer cached while it was on is not used (see
+        _show_layout_preview), and the run searches as it did before the preview existed."""
+        if not self._show_layout_preview():
+            return None
+        answered, clock = self._clock_locator.answer_for(video, game)
+        if not answered:
+            return None
+        calibration = clock.calibration if clock is not None and clock.error is None else None
+        # The search ran and calibrated nothing: the run skips its own pre-pass, which
+        # would sample the same frames by the same rules (None is a game with no detector,
+        # which has no search to hand over).
+        clock_searched = clock is not None and clock.error is None and calibration is None
+        # ...and the detector fired on none of its frames: the run skips its side-bar
+        # pre-pass too, as the Preview box skipped its own name search.
+        clock_never_fired = clock_searched and clock is not None and clock.first_hit_sec is None
+        side_record = None
+        if layout is None and game.has_side_bars:
+            side = self._side_overlay_locator.answer_for(
+                video, game, ocr_engine, ocr_lang, _calibrated_bbox(clock))
+            if side is not None and side.record is not None:
+                side_record = side.record.config
+        handover = PrepassHandover(video=video, game=game.id, clock_calibration=calibration,
+                                   clock_searched=clock_searched,
+                                   clock_never_fired=clock_never_fired,
+                                   side_overlay_record=side_record,
+                                   ocr_engine=ocr_engine, ocr_lang=ocr_lang)
+        if handover.is_empty:
+            return None
+        path = self._preview_pane.progress_file.with_name(PREPASS_HANDOVER_FILE_NAME)
+        return path if write_handover(path, handover) else None
+
+    def _on_edit_layouts(self) -> None:
+        """The Edit… button beside the Overlay layout combo: open the editor on that
+        choice (see _open_layout_editor). Auto's "" and the None of "New layout…" (a
+        game's only item while it has no preset) both open on a new layout."""
+        self._open_layout_editor(initial_layout=self._overlay_layout_combo.currentData())
+
+    def _open_layout_editor(self, initial_layout: str | None) -> None:
+        """Open the overlay-layout editor already scrubbing the chosen VOD (if any) at the
+        Preview box's playhead, on the main screen's game and on ``initial_layout`` (a
+        preset name; None or "" opens on a new layout), then rebuild the combo so a preset added/renamed/deleted in the editor
+        shows up. A preset saved in the editor (new or edited) becomes its game's selection:
+        it is what the user means to run with next, and the chooser would otherwise keep
+        that game's earlier pick (which is what it does when the editor closes without
+        saving)."""
+        # Imported lazily: OverlayLayoutEditorDialog pulls in cv2 and QtMultimedia, which are
+        # slow to import and unwanted on every launch, so it's loaded only when the user
+        # actually opens the editor (matches the repo's lazy-import idiom elsewhere).
+        from vodparse.gui.overlay_editor import OverlayLayoutEditorDialog
+        # The editor opens on the main screen's game (its own dropdowns can switch from
+        # there without touching the choices here).
+        # The editor's scrubber opens where the Preview box's stands, so the frame on
+        # screen is the one the boxes get drawn over. The video is the one this window
+        # already settled (past its own conversion offer), so the editor makes no second
+        # offer for it.
+        editor = OverlayLayoutEditorDialog(self._settings, self, initial_video=self._video_path,
+                                           initial_video_resolved=True,
+                                           initial_sec=self._preview_pane.playhead_sec(),
+                                           initial_game=self._game_combo.currentData(),
+                                           initial_layout=initial_layout)
+        editor.exec()
+        saved = editor.last_saved_layout
+        if saved is not None:
+            # Written to the saved preset's own game key: the rebuild below shows it when
+            # that is the game on screen, and switching to that game later shows it too.
+            self._settings.setValue(overlay_layout_setting_key(saved.game), saved.name)
+        self._populate_overlay_layout_combo()  # pick up any preset added/renamed/deleted
+
+    def _populate_game_combo(self) -> None:
+        """(Re)build the Game combo from the registry (vodparse.games.GAMES), display name as
+        text and id as data, and preselect the saved id (an unknown one falls back to the
+        default, see resolve_saved_game). Called on first build and after the Settings dialog
+        closes ("Reset all preferences" clears the key). Signals are blocked while rebuilding
+        for the same reason as _populate_overlay_layout_combo; the write-back at the end keeps
+        the key and the combo on one value, refreshes the note under the combo and fills the
+        Overlay layout combo for the restored game."""
+        saved = self._settings.value(SETTING_GAME, GAME_DEFAULT, type=str)
+        combo = self._game_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for game in GAMES:
+            combo.addItem(game.display_name, game.id)
+        combo.setCurrentIndex(combo.findData(resolve_saved_game(saved)))
+        combo.blockSignals(False)
+        self._on_game_selected()
+
+    def select_game(self, game_id: str) -> None:
+        """Select the game with registry id ``game_id`` in the Game combo, as a user pick
+        would (it is saved, and the note and Overlay layout combo follow). Public for the
+        ``--game`` launch option; an id the registry doesn't hold raises ValueError."""
+        index = self._game_combo.findData(game_id)
+        if index < 0:
+            raise ValueError(f"unknown game id {game_id!r}")
+        self._game_combo.setCurrentIndex(index)
+
+    def _on_game_selected(self) -> None:
+        """Persist the Game choice as soon as it changes, refresh its note, and rebuild the
+        Overlay layout combo: which presets it lists, and whether it offers Auto at all, are
+        both per game."""
+        self._settings.setValue(SETTING_GAME, self._game_combo.currentData())
+        self._refresh_game_note()
+        self._populate_overlay_layout_combo()
+
+    def _refresh_game_note(self) -> None:
+        """The note under the Game combo: the no-clock-detector note
+        (GAME_NOTE_NO_TIMER_MODEL, notice colour) while a game without a timer model of its
+        own is selected; the wrong-game doubt (GAME_NOTE_NO_CLOCK, warning colour) while the
+        clock search has found no steady clock for the selected game on the chosen video; nothing
+        otherwise. Refreshed on a game change, on every clock answer and on every video
+        choice."""
+        game = self._selected_game()
+        if not game.has_timer_model:
+            _colour_note(self._game_note, notice_color())
+            self._game_note.setText(GAME_NOTE_NO_TIMER_MODEL.format(game=game.display_name))
+            self._game_note.setVisible(True)
+            return
+        if self._wrong_game_suspected():
+            _colour_note(self._game_note, warning_color())
+            self._game_note.setText(GAME_NOTE_NO_CLOCK)
+            self._game_note.setVisible(True)
+            return
+        self._game_note.setVisible(False)
 
     def _offer_doctr_fetch(self, on_done: Callable[[bool], None]) -> None:
         """Ask before the one-time docTR model download, then run it. ``on_done`` receives
@@ -1411,12 +2159,33 @@ class MainWindow(QWidget):
         or failure: so callers can revert the engine choice or continue into a run."""
         reply = QMessageBox.question(
             self, "Download text models?",
-            f"docTR needs its text models (a one-time ~{DOCTR_WEIGHTS_MB_APPROX} MB download) "
-            "before it can read overlays. Download now?")
+            f"{FONT_STYLE_STYLIZED} needs to download text models (docTR) before it can be used. "
+            f"Download them now? (~{DOCTR_WEIGHTS_MB_APPROX} MB)")
         if reply != QMessageBox.StandardButton.Yes:
             on_done(False)
             return
         self._start_doctr_fetch(on_done)
+
+    def _offer_band_engine_fetch(self, game: Game, run: Callable[[bool], None]) -> None:
+        """Ask before a run whose game reads its nameplate band with docTR (Rivals 2) while
+        the Font style is another engine and docTR's models are not downloaded. Three
+        answers: Yes downloads them, then runs with docTR reading the band; No runs at once
+        with the band read by the user's own engine; Cancel runs nothing. ``run`` receives
+        whether the band falls back to the user's engine. A download that fails or is
+        cancelled runs nothing either: pressing Analyze VOD again asks again."""
+        reply = QMessageBox.question(
+            self, "Download text models?",
+            f"{game.display_name} needs an additional text model (docTR) to detect "
+            f"characters (~{DOCTR_WEIGHTS_MB_APPROX} MB).\n\n"
+            "Download it now? (\"No\" will attempt to run the analysis with the default "
+            "models).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._start_doctr_fetch(lambda ok: run(False) if ok else None)
+        elif reply == QMessageBox.StandardButton.No:
+            run(True)
 
     def _start_doctr_fetch(self, on_done: Callable[[bool], None]) -> None:
         """Run ``vodparse.cli.doctr_support fetch`` on a QProcess behind a modal, cancelable
@@ -1470,12 +2239,16 @@ class MainWindow(QWidget):
         proc.start(sys.executable, ["-m", "vodparse.cli.doctr_support", "fetch"])
 
     def _on_run(self) -> None:
-        """Analyze VOD: run the pipeline, then (on success) extract sets and open Review. The one
-        up-front confirm covers overwriting an existing analysis and/or saved edits; after that the
-        pipeline→extract→Review chain runs unattended. The argv itself is built by
-        commands.pipeline_argv; this method just resolves the widget/QSettings state it needs."""
+        """Analyze VOD: run the pipeline, then (on success) extract sets and open Review. The
+        wrong-game doubt is raised first (there is no point agreeing to overwrite an analysis
+        for a run the user then declines), then the one confirm that covers overwriting an
+        existing analysis and/or saved edits; after that the pipeline→extract→Review chain
+        runs unattended. The argv itself is built by commands.pipeline_argv; this method just
+        resolves the widget/QSettings state it needs."""
         video = self._video_path
         if video is None:
+            return
+        if self._wrong_game_suspected() and not self._confirm_no_clock():
             return
         if not self._confirm_overwrite_analysis():
             return
@@ -1486,39 +2259,104 @@ class MainWindow(QWidget):
             # The pipeline's own validate_engine_lang would stop the subprocess anyway;
             # catching it here turns a failed run into an actionable dialog.
             QMessageBox.warning(
-                self, "Stylized reads English only",
-                "The Stylized font style reads English/Latin text only. Switch "
+                self, f"{FONT_STYLE_STYLIZED} reads English only",
+                f"The {FONT_STYLE_STYLIZED} font style reads English/Latin text only. Switch "
                 "the overlay language back to English in Settings → Analysis, or set the Font style "
-                "to Standard.")
+                f"to {FONT_STYLE_STANDARD}.")
+            return
+
+        overlay_layout = self._overlay_layout_combo.currentData()
+        if overlay_layout is None:
+            # "New layout…" as the only item: the selected game has no clock detector and no
+            # preset saved for it yet, so this run would have no clock at all and nothing to
+            # split on. The pipeline refuses it too; catch it here with a dialog that says what
+            # to do.
+            QMessageBox.warning(
+                self, "Overlay layout needed",
+                f"{self._selected_game().display_name} needs a custom overlay layout with a "
+                "timer box. Click \"Edit\" to create one.")
+            return
+
+        layout = (layout_by_name(load_layouts(layouts_path()), overlay_layout)
+                  if overlay_layout else None)
+        if overlay_layout and layout is None:
+            # The preset was renamed or deleted since it was selected (the store can change on
+            # disk while the app runs); the pipeline itself would refuse it too, so catch it
+            # here with an actionable dialog instead of a failed run.
+            QMessageBox.warning(
+                self, "Overlay layout not found",
+                f"The overlay layout {overlay_layout!r} no longer exists. Pick another one "
+                "from the Overlay layout list, or click \"Edit\" to recreate it.")
+            self._populate_overlay_layout_combo()  # fall back to Auto now that we've said so
+            return
+
+        # The game's own nameplate band may pin docTR whatever the Font style says (Rivals 2
+        # reads its character names with it: games.IngameHud.ocr_engine).
+        game = self._selected_game()
+        band_engine = ingame_band_engine_for(game, ingame_band_mode_for(game, layout))
+        needs_doctr = OCR_ENGINE_DOCTR in (ocr_engine, band_engine)
+        if needs_doctr and not doctr_available():
+            # Nothing reads with Standard in docTR's place: without the package the run
+            # can't do what was asked, so say how to fix it rather than run with another engine.
+            why = (DOCTR_NOT_INSTALLED_MESSAGE if ocr_engine == OCR_ENGINE_DOCTR else
+                   f"{game.display_name} reads its nameplates with {FONT_STYLE_STYLIZED}. "
+                   f"{DOCTR_NOT_INSTALLED_MESSAGE}")
+            QMessageBox.warning(self, f"{FONT_STYLE_STYLIZED} isn't installed", why)
             return
 
         self._clear_log()
         ocr_interval = self._ocr_interval_combo.currentData()
         self._settings.setValue(SETTING_OCR_INTERVAL_SEC, ocr_interval)  # remember for next run
         self._settings.setValue(SETTING_OCR_ENGINE, ocr_engine)          # remember for next run
+        # The overlay layout is not written here: _on_overlay_layout_selected persists it on change.
         # The OCR speed-ups and the in-game nametag band live in Preferences (SettingsDialog);
         # read saved values. The band frac rides only on the pipeline argv: it is baked into the
         # pipeline JSON, which extract_matches reads back (see resolve_ingame_tag_band_frac).
-        gate_ocr = self._settings.value(SETTING_GATE_OCR_ON_TIMER, True, type=bool)
-        roi_cache = self._settings.value(SETTING_OCR_ROI_CACHE, True, type=bool)
+        gate_ocr = self._settings.value(SETTING_GATE_OCR_ON_TIMER, GATE_OCR_ON_TIMER_DEFAULT,
+                                        type=bool)
+        roi_cache = self._settings.value(SETTING_OCR_ROI_CACHE, OCR_ROI_CACHE_DEFAULT, type=bool)
         ingame_tag_frac = self._settings.value(
             SETTING_INGAME_TAG_BAND_FRAC, INGAME_TAG_BAND_FRAC_DEFAULT, type=float)
-        argv = pipeline_argv(
-            video, ocr_interval=ocr_interval, gate_ocr=gate_ocr, roi_cache=roi_cache,
-            ocr_lang=ocr_lang, ocr_engine=ocr_engine, ingame_tag_frac=ingame_tag_frac,
-            preview_file=self._preview_pane.preview_file,
-            progress_file=self._preview_pane.progress_file,
-        )
-        if ocr_engine == OCR_ENGINE_DOCTR and not doctr_weights_cached():
-            # Backstop for a saved docTR choice whose models were never (or no longer are)
-            # downloaded: the combo's own handler normally offered this at selection time.
-            self._offer_doctr_fetch(lambda ok: self._start_pipeline_run(argv) if ok else None)
+        game_id = self._game_combo.currentData()   # read now: the argv may be built after a download
+
+        def run_argv(band_on_overlay_engine: bool = False) -> list[str]:
+            """This run's pipeline argv; see commands.pipeline_argv for the flag. Built
+            when the run starts (after a model download, when there is one), so the
+            handover carries what the Preview box's searches have found by then."""
+            return pipeline_argv(
+                video, ocr_interval=ocr_interval, gate_ocr=gate_ocr, roi_cache=roi_cache,
+                ocr_lang=ocr_lang, ocr_engine=ocr_engine, ingame_tag_frac=ingame_tag_frac,
+                game=game_id, overlay_layout=overlay_layout,
+                band_on_overlay_engine=band_on_overlay_engine,
+                preview_file=self._preview_pane.preview_file,
+                progress_file=self._preview_pane.progress_file,
+                prepass_handover=self._write_prepass_handover(
+                    video, self._selected_game(), ocr_engine, ocr_lang, layout),
+            )
+
+        if needs_doctr and not doctr_weights_cached():
+            # Stylized without its models: chosen with the download declined, saved from a
+            # session that had them, or only the game's band wanting docTR (then this is the
+            # one place the offer can happen). Asked again on every Analyze until downloaded.
+            if ocr_engine == OCR_ENGINE_DOCTR:
+                # The user's own Font style is docTR: without its models there is nothing to
+                # read the overlay with, so a declined (or failed) download runs nothing.
+                self._offer_doctr_fetch(
+                    lambda ok: self._start_pipeline_run(run_argv()) if ok else None)
+            else:
+                # Only the game's band wants docTR: the user may also run without it, the band
+                # then read with their own engine (--ingame-band-engine overlay).
+                self._offer_band_engine_fetch(
+                    game, lambda on_overlay: self._start_pipeline_run(
+                        run_argv(band_on_overlay_engine=on_overlay)))
             return
-        self._start_pipeline_run(argv)
+        self._start_pipeline_run(run_argv())
 
     def _start_pipeline_run(self, argv: list[str]) -> None:
         """Launch the pipeline stage: the tail of _on_run, split out so a docTR model
         download can finish first and then continue straight into the run."""
+        self._clock_locator.cancel()   # no torch sidecar competing with the run
+        self._side_overlay_locator.cancel()
         self._preview_pane.start_run()
 
         self._append("> Running pipeline…\n")
@@ -1545,6 +2383,7 @@ class MainWindow(QWidget):
         if exit_code != 0 or exit_status != QProcess.ExitStatus.NormalExit:
             self._preview_pane.stop_run()
             self._set_running(False)
+            self._request_clock()  # still on the main page: the run held the clock search
             self._append(f"\n> Pipeline failed (exit code {exit_code}). Stopping.")
             self._show_log()  # surface the failure without making the user open it
             return
@@ -1559,15 +2398,14 @@ class MainWindow(QWidget):
         Shared by Analyze VOD (after the pipeline), Open existing analysis, and Re-read tags; the
         caller is responsible for confirming any saved-edit discard first. `tag_flags` overrides
         the tag-reading flags for this one run (Re-read tags passes its per-VOD choice); when None
-        the Advanced Extract Options are used. The global --debug preference is appended either way.
+        the Advanced Analysis Options are used. The global --debug preference is appended either way.
         The argv itself is built by commands.extract_argv."""
         video = self._video_path
         if video is None:
             return
         pipeline_json = pipeline_json_for(video)
-        mode: Literal["match", "tournament_set"] = (
-            "match" if self._match_radio.isChecked() else "tournament_set")
-        # Re-read tags supplies its own per-VOD tag flags; otherwise use the Advanced Extract
+        mode = self._selected_mode()
+        # Re-read tags supplies its own per-VOD tag flags; otherwise use the Advanced Analysis
         # Options. Either way the global --debug preference rides along.
         resolved_tag_flags = (tag_reading_flags(self._extract_opts) if tag_flags is None
                               else tag_flags)
@@ -1579,7 +2417,7 @@ class MainWindow(QWidget):
         )
         # Remembered at kickoff (not read back from _extract_opts on finish) so the summary
         # popup matches the run that actually happened, even if the options change meanwhile.
-        self._extract_was_smart = "--smart-tags" in argv
+        self._extract_was_smart = SMART_TAGS_FLAG in argv
 
         self._append("\n> Extracting games…\n")
         self._set_running(True)
@@ -1595,6 +2433,7 @@ class MainWindow(QWidget):
         # Open-existing/Re-read paths, where the progress pane was never shown).
         if self._stage_failed(exit_code, exit_status, "Game extraction"):
             self._preview_pane.hide_progress()
+            self._request_clock()  # still on the main page: the run held the clock search
             return
         # A fresh extract supersedes any prior edits (the user was warned before the run); drop the
         # draft so Review loads clean. Were a stale draft to survive, its protection would be
@@ -1610,31 +2449,24 @@ class MainWindow(QWidget):
             self._show_smart_tags_summary(video)
         self._load_review()
         self._preview_pane.hide_progress()  # after the switch, so the hold spans the whole load
+        self._request_clock()  # a Review that failed to load leaves the main page showing
 
     def _show_smart_tags_summary(self, video: str) -> None:
         """Pop the smart-tags outcome: the winning flag combination and the runner-up, with
         their scores: read from the report the extract run just wrote. (The full 16-row
         ranking table went to the log transcript: Debug → Show log….) Defensive on a
         missing/malformed report: the popup is informational and must never block Review."""
-        try:
-            report = json.loads(
-                (output_dir_for(video) / SMART_TAGS_REPORT_NAME).read_text(encoding="utf-8"),
-            )
-            lines = [_smart_entry_text("Picked", report["winner"])]
-            if report.get("runner_up"):
-                lines.append(_smart_entry_text("Runner-up", report["runner_up"]))
-        except (OSError, ValueError, KeyError, TypeError):
-            return
-        QMessageBox.information(self, "Smart tag reading",
-                                "\n\n".join(lines) + "\n\nFull toggle ranking: Debug → Show log…")
+        show_smart_tags_summary(self, output_dir_for(video) / SMART_TAGS_REPORT_NAME,
+                                log_menu_path="Debug → Show log…")
 
     def _on_reread_tags(self) -> None:
         """Re-read tags (Review screen): re-run the cheap --csv-only extraction for THIS vod under
         different tag-reading flags and refresh Review in place. The dialog is seeded from the flags
         that produced the current matches.json (the per-VOD sidecar), not the global options, and
         its choice drives this one run only: the global extract/opt_* settings are left untouched
-        (contrast _edit_extract_options, which persists). Mode/group-by/set-characters keep
-        coming from the Main-page widgets, the same source _load_review reads when it re-renders."""
+        (contrast _edit_extract_options, which persists). Mode and set-characters keep coming
+        from the Advanced Analysis Options and group-by from the Main page, the same sources
+        _load_review reads when it re-renders."""
         video = self._video_path
         if video is None:
             return
@@ -1666,11 +2498,8 @@ class MainWindow(QWidget):
         # If clips were already exported, the export-output buttons now fall back to that
         # older export (resolve_export_csv): say so, since the new name only reaches the
         # clips/CSV/titles through a fresh export.
-        target = self._review.export_target()
-        if target is not None and self._current_export_csv() != export_csv_for(*target,
-                                                                              export_root()):
-            self._review.show_status(
-                "Already-exported clips keep the previous name. Export again to apply the new one.")
+        if rename_leaves_exported_clips_behind(self._review, export_root()):
+            self._review.show_status(RENAME_EXPORT_NOTE)
 
     def _load_review(self) -> None:
         video = self._video_path
@@ -1683,13 +2512,13 @@ class MainWindow(QWidget):
         except (OSError, json.JSONDecodeError) as e:
             self._append(f"\n> Could not load {matches_json.name}: {e}")
             return
-        mode = "match" if self._match_radio.isChecked() else "tournament_set"
+        mode = self._selected_mode()
         self._review.load_model(matches, mode, self._selected_group_by(),
                                 video, stem,
                                 tournament_name=self._tournament_edit.text().strip(),
                                 set_characters=self._selected_set_characters())
         self._append("\n> Loaded games. Review, then Export clips.")
-        self._stack.setCurrentIndex(1)
+        self._show_page(1)
         # Refresh the mode note in case a re-read kept us on the Review page.
         self._update_title(1)
         self._relabel_export_selected_action()
@@ -1705,7 +2534,7 @@ class MainWindow(QWidget):
                                             set_characters=self._selected_set_characters()):
             return False
         self._append("\n> Resumed saved edits. Review, then Export clips.")
-        self._stack.setCurrentIndex(1)
+        self._show_page(1)
         self._relabel_export_selected_action()
         return True
 
@@ -1715,7 +2544,7 @@ class MainWindow(QWidget):
         instead, falling back to a fresh load if no draft exists."""
         self._video_path = vod
         self._file_label.setText(Path(vod).name)
-        self._preview_pane.set_video(self._video_path)
+        self._load_video_into_preview(vod)
         self._seed_tournament_name()  # --debug sets _video_path directly, bypassing _on_choose
         self._refresh_nav()
         if resume:
@@ -1729,7 +2558,8 @@ class MainWindow(QWidget):
         self._load_review()
 
     def _on_review_export(self, data: dict) -> None:
-        if self._process_running():
+        if self._process_running():   # a reread (or the run itself) is still going
+            self._review.show_status(BUSY_EXPORT_NOTE)
             return
         data["title_char_limit"] = self._title_char_limit()
         data["title_filenames"] = self._title_filenames(data["mode"])
@@ -1755,6 +2585,13 @@ class MainWindow(QWidget):
         # The previous export, looked up BEFORE write_json_atomic below replaces reviewed.json
         # (destroying the export_folder/export_csv records that point at it).
         previous = last_export_info(data["stem"], self._export_root)
+        # The tournament's CSV may already list other VODs (a stream restart splits one
+        # tournament across several files). Confirm the first time this VOD joins one, and
+        # back out before anything is written if the user cancels.
+        export_csv = self._export_dir / f"{self._export_dir.name}.csv"
+        if not self._confirm_shared_export_csv(export_csv, data["stem"]):
+            return
+        self._previous_clip_names = vod_clip_filenames(export_csv, data["stem"])
         if previous is not None and previous.csv.exists():
             # Carry the previous export records through the rewrite: if this export fails, the
             # export-output buttons can still fall back to the old clips (resolve_export_csv);
@@ -1764,11 +2601,11 @@ class MainWindow(QWidget):
         # A rename moves the export to a new folder, silently duplicating the clips' disk
         # space: remember the superseded folder and offer to delete it on success.
         self._stale_export_dir = stale_export_dir(previous, self._export_dir, data["mode"],
-                                                  self._export_root)
+                                                  self._export_root, stem=data["stem"])
         write_json_atomic(out, data)
         self._append(f"\n> Exporting clips from {out.name}…\n")
-        self._set_running(True)
         self._exporting = True
+        self._set_running(True)
         # Size the bar from the payload that actually gets exported: build_reviewed_data drops
         # excluded sets, and the subprocess prints one "  Saved:" line per surviving clip, so
         # len(data["clips"]) is exactly how many lines will arrive (finding S2).
@@ -1777,6 +2614,69 @@ class MainWindow(QWidget):
         self._start_process(["-m", "vodparse.cli.export_reviewed", "--input", str(out),
                              "--out-root", str(self._export_root)],
                             self._on_export_finished)
+
+    def _confirm_shared_export_csv(self, csv_path: Path, stem: str) -> bool:
+        """Whether the export of VOD `stem` may go ahead into the tournament CSV at
+        `csv_path`. When this VOD would join a CSV that already lists other VODs for the
+        first time (see gui.paths.other_vods_to_confirm), ask: "Add to tournament" goes
+        ahead, anything else cancels. An unreadable CSV is handed to
+        _confirm_overwrite_unreadable_csv: the export would refuse it, after the user waited
+        for nothing."""
+        try:
+            other_vods = other_vods_to_confirm(csv_path, stem)
+        except CSV_READ_ERRORS as err:
+            return self._confirm_overwrite_unreadable_csv(csv_path, err)
+        if not other_vods:
+            return True
+        lines = [f"• {other_vod}: {count} clip{'s' if count != 1 else ''}"
+                 for other_vod, count in other_vods.items()]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Add to an existing tournament export?")
+        source = "another VOD" if len(other_vods) == 1 else "other VODs"
+        box.setText(f"“{csv_path.parent.name}” already has clips from {source}:\n\n"
+                    + "\n".join(lines))
+        box.setInformativeText(
+            "Adding this VOD's clips puts the whole tournament in one CSV for the Upload "
+            "Assistant.\n\n"
+            "If this is a different event, cancel and change the tournament name.")
+        add_btn = box.addButton("Add to tournament", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(add_btn)
+        self._keep_above_assistant(box)
+        box.exec()
+        return box.clickedButton() is add_btn
+
+    def _confirm_overwrite_unreadable_csv(self, csv_path: Path, err: Exception) -> bool:
+        """The tournament CSV at `csv_path` exists but can't be read (`err` says why), so the
+        export would refuse it: it may list other VODs' clips, and writing this VOD's rows
+        over it would lose them. Ask. Overwrite deletes the file, and the export then
+        writes a new CSV of this VOD's clips alone; Cancel, the default, backs out and
+        leaves the file for the user to move or fix. A file that can't be deleted (open in
+        a spreadsheet app, on Windows) is warned about and backs out too."""
+        box = QMessageBox(
+            QMessageBox.Icon.Warning, "Can't read the export's CSV",
+            f"{csv_path}\n\ncouldn't be read ({err}).\n\n"
+            "Move it out of the folder and export again.\n\n"
+            "Overwrite replaces it with a CSV of this VOD's clips only.",
+            parent=self)
+        overwrite_btn = box.addButton("Overwrite", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        self._keep_above_assistant(box)
+        box.exec()
+        if box.clickedButton() is not overwrite_btn:
+            return False
+        try:
+            csv_path.unlink(missing_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Couldn't overwrite the CSV",
+                f"{csv_path}\n\ncouldn't be removed ({exc}).\n\n"
+                "Close it in any program that has it open and export again.")
+            return False
+        self._append(f"\n> Removed the unreadable {csv_path.name}; the export writes a new one.")
+        return True
 
     def _warn_export_root_unavailable(self, root: Path) -> None:
         """Tell the user an export can't proceed because its destination root is missing
@@ -1875,6 +2775,7 @@ class MainWindow(QWidget):
                 except OSError:
                     pass
             return
+        path = str(Path(path))  # Qt's dialog spells Windows paths with "/": show them natively
         # The subprocess reads the projection from a sibling file, NOT reviewed.json: a
         # single-clip cut is not a full export, and rewriting the canonical file would
         # replace its mode/tournament fields while old export records carry through:
@@ -1949,7 +2850,9 @@ class MainWindow(QWidget):
     def _on_export_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
         """Clip export done: back to idle and refresh the export-output buttons; on success
         show the completion dialog (repeating any title-length warnings from the log) with
-        Open-folder / Upload-Assistant shortcuts."""
+        Open-folder / Upload-Assistant shortcuts, plus an opt-in checkbox to delete the
+        previous export's folder after a rename, or to remove the clips a re-export left
+        behind."""
         if self._consume_stop():
             return
         self._exporting = False
@@ -1957,9 +2860,12 @@ class MainWindow(QWidget):
         # export is then still the only complete one, so it must not be offered for deletion).
         stale = self._stale_export_dir
         self._stale_export_dir = None
+        previous_clip_names = self._previous_clip_names
+        self._previous_clip_names = frozenset()
         self._set_running(False)
         self._review.set_exporting(False)
         self._refresh_export_outputs()  # exported clips/folder now (likely) exist; reflect on buttons
+        self._reload_assistant_showing(self._export_dir / f"{self._export_dir.name}.csv")
         if self._stage_failed(exit_code, exit_status, "Clip export"):
             return
         self._append(f"\n> Clips exported to {self._export_dir}.")
@@ -1996,11 +2902,29 @@ class MainWindow(QWidget):
             delete_box = QCheckBox(
                 f"Delete the previous export ({_dir_size_gb(stale):.1f} GB):\n{stale}")
             box.setCheckBox(delete_box)
+        # A re-export into the same folder replaced this VOD's CSV rows, but the clips it no
+        # longer lists (merged, split, retitled, excluded) are still on disk: offer to remove
+        # them, opt-in like the folder offer. A QMessageBox holds one checkbox, so the folder
+        # offer wins on the rare export that qualifies for both.
+        outdated: list[Path] = []
+        outdated_box: QCheckBox | None = None
+        if delete_box is None and previous_clip_names:
+            outdated = outdated_clip_files(
+                self._export_dir, self._export_dir / f"{self._export_dir.name}.csv",
+                previous_clip_names)
+        if outdated:
+            outdated_box = QCheckBox(
+                f"Remove {len(outdated)} outdated clip{'s' if len(outdated) != 1 else ''} "
+                f"from this VOD's last export ({_files_size_gb(outdated):.1f} GB)")
+            outdated_box.setToolTip(_outdated_clips_tooltip(outdated))
+            box.setCheckBox(outdated_box)
         box.exec()
         clicked = box.clickedButton()
         if stale is not None and delete_box is not None and delete_box.isChecked():
             if self._delete_stale_export(stale):
                 self._retarget_assistant_after_delete(stale)
+        if outdated_box is not None and outdated_box.isChecked():
+            self._delete_outdated_clips(outdated)
         if clicked is open_folder_btn:
             self._open_folder(self._export_dir)
         elif clicked is assistant_btn:
@@ -2029,13 +2953,58 @@ class MainWindow(QWidget):
         try:
             shutil.rmtree(folder)
         except OSError as err:
-            QMessageBox.warning(
-                self, "Couldn't delete previous export",
+            box = QMessageBox(
+                QMessageBox.Icon.Warning, "Couldn't delete previous export",
                 f"“{folder.name}” couldn't be fully deleted:\n{err}\n\n"
-                "A file inside may be open in another program.")
+                "A file inside may be open in another program.",
+                parent=self)
+            self._keep_above_assistant(box)  # the export may have finished under an open assistant
+            box.exec()
             return False
         self._append(f"\n> Deleted previous export {folder}.")
         return True
+
+    def _delete_outdated_clips(self, clips: list[Path]) -> None:
+        """Remove the clip files a re-export left behind (the ticked offer in the
+        Export-complete dialog; vetted by gui.paths.outdated_clip_files). Windows refuses
+        while a clip is open in another program: the rest are still removed, and the ones
+        that couldn't be are listed in one warning."""
+        failed: list[str] = []
+        for clip in clips:
+            try:
+                clip.unlink()
+            except FileNotFoundError:
+                continue  # already gone: nothing left to remove
+            except OSError as err:
+                failed.append(f"{clip.name}: {err}")
+                continue
+            self._append(f"\n> Removed outdated clip {clip}.")
+        if failed:
+            box = QMessageBox(
+                QMessageBox.Icon.Warning, "Couldn't remove some outdated clips",
+                "These clips couldn't be removed:\n\n" + "\n".join(failed)
+                + "\n\nA file may be open in another program.",
+                parent=self)
+            self._keep_above_assistant(box)
+            box.exec()
+
+    def _reload_assistant_showing(self, csv: Path) -> None:
+        """Reload an open Upload Assistant that has `csv` loaded, which an export just
+        rewrote: the CSV can be shared by a tournament's VODs, so the export may have
+        added or replaced rows the assistant doesn't have, and its next save would write
+        its stale rows back over them (see UploadAssistant.reload_csv). Runs after a
+        failed export too: harmless when the CSV didn't change."""
+        if self._upload_assistant is None:
+            return
+        loaded = self._upload_assistant.loaded_csv()
+        if loaded is None:
+            return
+        try:
+            showing = loaded.samefile(csv)
+        except OSError:
+            showing = False  # either file is gone: nothing loaded to go stale
+        if showing:
+            self._upload_assistant.reload_csv()
 
     def _retarget_assistant_after_delete(self, deleted: Path) -> None:
         """After deleting a superseded export folder, reload an open Upload Assistant that
@@ -2147,6 +3116,7 @@ class MainWindow(QWidget):
             self, "Save diagnostics bundle", suggested, "Zip archives (*.zip)")
         if not path:
             return
+        path = str(Path(path))  # Qt's dialog spells Windows paths with "/": show them natively
         # Snapshot the user's settings into the manifest (all inert preferences: title limits,
         # toggles, intervals). Passed as one JSON argv element; QProcess needs no shell quoting.
         settings = {k: str(self._settings.value(k)) for k in self._settings.allKeys()}
@@ -2202,43 +3172,68 @@ class MainWindow(QWidget):
             return False
         self._stopping = False
         self._exporting = False
+        self._stale_export_dir = None          # the kickoff captures live for one export
+        self._previous_clip_names = frozenset()
         self._review.set_exporting(False)
         self._preview_pane.stop_run()
         self._set_running(False)
+        self._request_clock()  # a stopped Analyze run held the Preview box's clock search
         self._append("\n⏹ Stopped.")
         return True
 
     def _stop_process(self) -> None:
-        """Shut down the child process, politely first, so quitting never orphans it."""
+        """Shut down the child process, so quitting never orphans it: politely first where a
+        polite stop can reach it, else by force."""
         if not self._process_running():
             return
         assert self._proc is not None  # implied by _process_running()
+        if sys.platform == "win32":
+            # On Windows terminate() only posts WM_CLOSE, which a windowless stage process
+            # never reads: it always sat out the full STOP_TERM_WAIT_MS (a frozen UI) before
+            # the kill() below. No stage handles a polite stop anyway, so kill at once.
+            self._proc.kill()
+            self._proc.waitForFinished(STOP_KILL_WAIT_MS)
+            return
         self._proc.terminate()
         if not self._proc.waitForFinished(STOP_TERM_WAIT_MS):
             self._proc.kill()
             self._proc.waitForFinished(STOP_KILL_WAIT_MS)
 
     def closeEvent(self, event: QCloseEvent | None) -> None:
-        self._settings.setValue(self._geometry_key(self._active_screen), self.saveGeometry())
+        self._settings.setValue(self._geometry_key(self._stack.currentIndex()), self.saveGeometry())
         # Before anything that spins a nested event loop (the prompt below): a resolving
         # update check would otherwise deliver its queued verdict inside that loop and pop
         # a dialog over the quit confirmation. If the user then answers No, the dismissed
         # check revives on the next Help ▸ Check for Updates click.
         self._updates.dismiss()
         if self._process_running():
-            answer = QMessageBox.question(
-                self, "Quit?",
+            box = QMessageBox(
+                QMessageBox.Icon.Question, "Quit?",
                 "A run is still in progress. Quit anyway?\n\n"
                 "The current analysis will be stopped and its progress lost.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
+                parent=self)
+            box.setDefaultButton(QMessageBox.StandardButton.No)
+            # An export started before the assistant opened is a run too, and Alt+F4 still
+            # reaches the locked main window (see the assistant's close below).
+            self._keep_above_assistant(box)
+            box.exec()
+            if box.clickedButton() is not box.button(QMessageBox.StandardButton.Yes):
                 if event is not None:
                     event.ignore()
                 return
             self._stopping = True  # route the synchronous finish through _consume_stop, not the failure path
-            self._stop_process()
+        self._shutting_down = True
+        # The Upload Assistant is its own top-level window. Left open, it kept the app running
+        # after the (locked) main window closed, with no way back to it: Alt+F4 and the
+        # taskbar's Close both reach a disabled window on Windows. Quitting closes it too.
+        if self._upload_assistant is not None:
+            self._upload_assistant.close()
+        # Background work first: stopping the run below finishes it synchronously, and its
+        # finish handler would otherwise restart the clock search and the preview's OCR
+        # helper just before the teardown kills them.
         self._teardown_background_work()
+        self._stop_process()   # a no-op when no run is going
         if event is not None:
             event.accept()
 
@@ -2248,12 +3243,17 @@ class MainWindow(QWidget):
         crash (a ``QThread`` destroyed while running aborts the app)."""
         self._converter.cancel_active()   # don't leave an ffmpeg conversion running past the window
         self._gpu.cancel_active_probes()  # nor a torch-importing GPU probe
+        self._clock_locator.cancel()      # nor the preview's clock-search sidecar
+        self._side_overlay_locator.cancel()   # nor its player-name search
+        self._preview_pane.shutdown()     # nor its ffmpeg frame grab / media player
         self._updates.shutdown()          # a check thread destroyed while running aborts teardown
 
     def force_quit(self) -> None:
-        """Quit without the confirmation prompt (Ctrl+C in the terminal)."""
-        self._stop_process()
+        """Quit without the confirmation prompt (Ctrl+C in the terminal). The background work
+        is torn down before the run is stopped, as in closeEvent."""
+        self._shutting_down = True
         self._teardown_background_work()
+        self._stop_process()
         QApplication.quit()
 
     def _start_process(self, argv: list[str], on_finished: FinishHandler) -> None:
@@ -2393,6 +3393,17 @@ class MainWindow(QWidget):
         self._append(f"Flipped the OS theme to {'light' if light else 'dark'}{log_note}")
 
 
+APPLICATION_NAME = "Ultimate VOD Studio"
+
+
+def settings_application_name(profile: str | None) -> str:
+    """The application name QSettings files the settings under: the app's own, or for a
+    ``--settings-profile`` run a separate store beside it ("Ultimate VOD Studio (test)")."""
+    if not profile:
+        return APPLICATION_NAME
+    return f"{APPLICATION_NAME} ({profile})"
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ultimate VOD Studio GUI")
     parser.add_argument("--debug", metavar="VOD", default=None,
@@ -2401,6 +3412,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-resume", action="store_true",
                         help="With --debug, reopen the saved Review edit draft instead of loading "
                              "fresh from the extract (falls back to fresh if no draft exists).")
+    # Launch options for testing and GUI automation: start in a known state without the file
+    # dialog, and keep a test run's choices out of the user's own settings.
+    parser.add_argument("--game", choices=[game.id for game in GAMES], default=None,
+                        help="Select this game at startup (saved like a pick in the Game combo).")
+    parser.add_argument("--video", metavar="PATH", default=None,
+                        help="Choose this video at startup, as Choose video… would (conversion "
+                             "and re-encode offers included). Applied after --game.")
+    parser.add_argument("--settings-profile", metavar="NAME", default=None,
+                        help="Keep settings in a separate store named after NAME instead of the "
+                             "user's own, so a test run's choices never change theirs.")
     args, _ = parser.parse_known_args()  # ignore Qt's own args
     return args
 
@@ -2434,7 +3455,7 @@ def main() -> None:
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     app.setOrganizationName("Ultimate VOD Studio")
     app.setOrganizationDomain("ultimatevodstudio.app")
-    app.setApplicationName("Ultimate VOD Studio")
+    app.setApplicationName(settings_application_name(args.settings_profile))
     # Scale the whole UI's text per the saved "Text size" preference, before any widget is built
     # (see apply_font_scale). QSettings() needs the org/app identity above to resolve the right file.
     apply_font_scale(app, QSettings().value(SETTING_FONT_SCALE, FONT_SCALE_DEFAULT, type=float))
@@ -2448,6 +3469,10 @@ def main() -> None:
     sigint_timer.start(SIGINT_PUMP_INTERVAL_MS)
     window.show()
     window.restore_startup_geometry()
+    if args.game:
+        window.select_game(args.game)
+    if args.video:
+        window.choose_video(args.video)
     if args.debug:
         window.load_debug_vod(args.debug, resume=args.debug_resume)
     sys.exit(app.exec())

@@ -1,10 +1,11 @@
 """Bounding-box geometry helpers used across OCR detection stages."""
 
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import numpy as np
 
-from vodparse.schema import TextBox
+from vodparse.schema import BBox, TextBox
 
 
 def crop_frame(frame: np.ndarray, bbox: Sequence[float] | Sequence[int]) -> np.ndarray | None:
@@ -19,6 +20,14 @@ def crop_frame(frame: np.ndarray, bbox: Sequence[float] | Sequence[int]) -> np.n
     if x2 <= x1 or y2 <= y1:
         return None
     return frame[y1:y2, x1:x2]
+
+
+def quad_to_bbox(text: TextBox) -> BBox:
+    """A text box's four-corner quad as an axis-aligned pixel box ``[x1, y1, x2, y2]``:
+    where a read sits, for drawing it or comparing it with a detector box."""
+    xs = [point[0] for point in text["bbox"]]
+    ys = [point[1] for point in text["bbox"]]
+    return [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
 
 
 def bbox_center_y(text: TextBox) -> float:
@@ -75,15 +84,40 @@ def longest_text(boxes: list[TextBox]) -> TextBox:
     return max(boxes, key=lambda t: (len(t["text"].strip()), bbox_center_x(t)))
 
 
+class _ScoredPair(NamedTuple):
+    """One candidate pair of best_mirrored_pair with everything its ranking reads, in
+    ranking order (see ``rank``)."""
+    symmetry_bucket: int
+    negative_height: float
+    negative_text_length: int
+    symmetry_error: float
+    center_y: float
+    left_x: float
+    right_x: float
+    pair: list[TextBox]
+
+    def rank(self) -> tuple[int, float, int, float, float, float, float]:
+        """The sort key: every field but the pair, in order. Two distinct pairs cannot
+        share every field, so the order is total."""
+        return (self.symmetry_bucket, self.negative_height, self.negative_text_length,
+                self.symmetry_error, self.center_y, self.left_x, self.right_x)
+
+
 def best_mirrored_pair(candidates: list[TextBox], frame_width: int,
                         y_tolerance: int, sym_tolerance: int) -> list[TextBox] | None:
     """From a set of text boxes, return the [left, right] pair on opposite sides of
     center that sit at similar height and best mirror each other in distance from
     their nearest edge. Pairs within sym_tolerance are treated as equally mirrored
     and the one whose shorter box is tallest wins (real labels are both rendered
-    tall). Returns None if no opposite-side, similar-height pair exists."""
+    tall). A pair still tied on both counts is settled by text, then by position:
+    the pair with more characters wins (a sponsor beside a tag is short, the tag is
+    not), then the better-mirrored pair within the bucket, then the higher pair, then
+    the leftmost, then the one whose right box starts leftmost. The input order never
+    decides: two frames whose boxes arrive in a different order pick the same pair,
+    which the in-game-name confirmation downstream relies on. Returns None if no
+    opposite-side, similar-height pair exists."""
     mid_x  = frame_width / 2
-    scored = []  # (symmetry_bucket, -height, [left, right])
+    scored: list[_ScoredPair] = []
 
     for i in range(len(candidates)):
         for j in range(i + 1, len(candidates)):
@@ -95,10 +129,16 @@ def best_mirrored_pair(candidates: list[TextBox], frame_width: int,
             left  = a if bbox_center_x(a) < mid_x else b
             right = b if bbox_center_x(b) >= mid_x else a
             error  = abs(bbox_min_x(left) - (frame_width - bbox_max_x(right)))
-            height = min(bbox_height(left), bbox_height(right))
-            scored.append((round(error / sym_tolerance), -height, [left, right]))
+            scored.append(_ScoredPair(
+                symmetry_bucket=round(error / sym_tolerance),
+                negative_height=-min(bbox_height(left), bbox_height(right)),
+                negative_text_length=-(len(left["text"].strip()) + len(right["text"].strip())),
+                symmetry_error=error,
+                center_y=(bbox_center_y(left) + bbox_center_y(right)) / 2,
+                left_x=bbox_min_x(left),
+                right_x=bbox_min_x(right),
+                pair=[left, right]))
 
     if not scored:
         return None
-    scored.sort(key=lambda c: (c[0], c[1]))
-    return scored[0][2]
+    return min(scored, key=_ScoredPair.rank).pair

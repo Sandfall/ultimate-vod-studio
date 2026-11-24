@@ -18,6 +18,9 @@ vendor/
 
 # App output (the GUI / pipeline stages)
 json_output/
+# The user's saved custom-overlay-layout presets (vodparse.overlay_layout writes this
+# at the workspace root, next to json_output/): user content, never repo content.
+overlay_layouts.json
 video_out/
 runs/
 
@@ -27,6 +30,7 @@ runs/
 *.mkv
 *.avi
 *.mov
+*.webm
 # Partial-download debris
 *.part
 

@@ -1,4 +1,4 @@
-"""Per-VOD text-region calibration for recognizer-only full-frame OCR.
+"""Per-VOD text-region calibration for recognizer-only OCR of fixed screen regions.
 
 The expensive half of the full-frame text pass is CRAFT text DETECTION (measured at 85-89%
 of the pass on CPU), and within one VOD it keeps re-discovering the same answer: stream
@@ -43,21 +43,30 @@ Every sampled frame still yields a text read attempt, so tag-vote cardinality (a
 splitter, which never reads texts at all) is unchanged; the failure mode this trades into is
 a text element at a genuinely NEW position going unread until the next refresh, which the
 per-game majority vote absorbs.
+
+REGIONS, not just bands: the cache is generic over named rectangular regions of the frame
+(``OcrRoiCache.for_bands`` builds the two overlay bands, mirroring pipeline.detect_text's
+crops), and its steady-state read goes through ``OverlayOcr.recognize_boxes``, so it is not
+tied to EasyOCR's API. It is nonetheless ENABLED FOR EASYOCR ONLY: an A/B on three docTR
+VODs (2026-09-03) showed docTR's recognizer returning confident
+punctuation for empty crops (so a cached box never reads empty and EMPTY_STREAK_LIMIT never
+fires) and its detector segmenting the same word differently frame to frame (so the read
+set accumulates overlapping fragments and tokens double: 'KANSAS KANSAS'); tag votes and
+set grouping regressed on every VOD for a ~12% speed-up. A per-box cache over a custom
+layout's drawn boxes was tried and dropped for the same reasons; those boxes are read with
+the full text pass every sample (vodparse.layout_reads).
 """
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
-import cv2
 import numpy as np
 
 from vodparse.match_extraction import INTERMISSION_MIN_SAMPLES, RESET_JUMP_SEC
+from vodparse.ocr_engine import OverlayOcr, Rect
+from vodparse.overlay_bands import band_boxes
 from vodparse.schema import TextBox
-from vodparse.tags import OVERLAY_BOTTOM_FRAC, TAG_TOP_FRAC
-
-if TYPE_CHECKING:
-    import easyocr
+from vodparse.tags import OVERLAY_BOTTOM_FRAC
 
 # ── Tuning constants ───────────────────────────────────────────────────────────
 
@@ -82,7 +91,7 @@ MATCH_X_FRAC = 0.5
 MATCH_Y_FRAC = 0.7
 
 
-Rect = tuple[int, int, int, int]   # axis-aligned (x_min, y_min, x_max, y_max), full-frame px
+# Rect (from ocr_engine): axis-aligned (x_min, y_min, x_max, y_max); full-frame px here.
 
 
 def _hull(box: list[list[int]]) -> Rect:
@@ -113,10 +122,11 @@ class _Roi:
 
 
 @dataclass
-class _BandState:
-    """Rolling calibration state for one horizontal band (top overlay / bottom nameplates)."""
-    y0_frac: float                    # band bounds as frame-height fractions, mirroring
-    y1_frac: float                    # pipeline.detect_text's crop exactly
+class _RegionState:
+    """Rolling calibration state for one region of the frame: an overlay band (top / bottom
+    nameplates) or a custom layout's drawn box."""
+    region: Rect                      # the region's full-frame pixel bounds, mirroring the
+                                      # crop its full-pass reads cover exactly
     window: deque[list[Rect]] = field(default_factory=lambda: deque(maxlen=CAL_FRAMES))
     stable: list[Rect] = field(default_factory=list)   # boxes recurring across the window
     rois: list[_Roi] = field(default_factory=list)     # read set = the newest pass's boxes
@@ -128,17 +138,25 @@ class _BandState:
 
     @property
     def empty(self) -> bool:
-        """All window frames found nothing → this VOD has no text in this band; skip it."""
+        """All window frames found nothing → this VOD has no text in this region; skip it."""
         return self.calibrated and not any(self.window)
 
     @property
     def steady(self) -> bool:
-        """Cacheable: enough full reads seen, and some text position actually recurs. A band
+        """Cacheable: enough full reads seen, and some text position actually recurs. A region
         whose boxes churn frame-to-frame (no stable set) keeps today's full pass forever."""
         return self.calibrated and bool(self.stable)
 
-    def rebuild(self, frame_height: int) -> None:
-        """Recompute the band's state from the rolling window. The STABLE set (positions
+    def contains(self, text: TextBox) -> bool:
+        """Whether a full-pass read's center lies inside this region."""
+        points = text["bbox"]
+        cx = sum(p[0] for p in points) / len(points)
+        cy = sum(p[1] for p in points) / len(points)
+        x0, y0, x1, y1 = self.region
+        return x0 <= cx < x1 and y0 <= cy < y1
+
+    def rebuild(self) -> None:
+        """Recompute the region's state from the rolling window. The STABLE set (positions
         recurring in >= STABLE_MIN window frames) decides cacheability and anchors the
         layout-change check. The READ set is every distinct box position across the window:
         neither filtered by stability (a flaky nameplate box must not drop out for a whole
@@ -156,11 +174,11 @@ class _BandState:
         self.stable = [rep for rep, seen in clusters if len(seen) >= STABLE_MIN]
         rois = [_Roi(rep) for rep, _ in clusters]
 
-        y_lo, y_hi = int(frame_height * self.y0_frac), int(frame_height * self.y1_frac)
+        x_lo, y_lo, x_hi, y_hi = self.region
         for roi in rois:
             x0, y0, x1, y1 = roi.box
-            roi.read = (x0 - PAD_PX, max(y_lo, y0 - PAD_PX),
-                        x1 + PAD_PX, min(y_hi, y1 + PAD_PX))
+            roi.read = (max(x_lo, x0 - PAD_PX), max(y_lo, y0 - PAD_PX),
+                        min(x_hi, x1 + PAD_PX), min(y_hi, y1 + PAD_PX))
         # Same-row neighbours (e.g. [sponsor][gamertag]): stop each pad at the gap midpoint
         # so one region's read crop can't include the neighbour's text.
         rois.sort(key=lambda r: r.box[0])
@@ -175,8 +193,8 @@ class _BandState:
                               right.read[2], right.read[3])
         self.rois = rois
 
-    def observe(self, boxes: list[Rect], frame_height: int) -> None:
-        """Feed one full-CRAFT read into the window. A calibrated band whose STABLE positions
+    def observe(self, boxes: list[Rect]) -> None:
+        """Feed one full-CRAFT read into the window. A calibrated region whose STABLE positions
         no longer show up (fewer than VERIFY_KEEP_FRAC re-found) has changed layout: drop the
         window and recalibrate from scratch rather than serving a stale cache. The stable set
         is the anchor here on purpose: transient gameplay text churns between full reads and
@@ -189,7 +207,7 @@ class _BandState:
                 self.rois = []
         self.window.append(boxes)
         self.empty_streak = 0
-        self.rebuild(frame_height)
+        self.rebuild()
 
 
 class OcrRoiCache:
@@ -201,22 +219,43 @@ class OcrRoiCache:
          or the frame is clock-less; this drives new-game detection from the clock stream.
       2. should_run_full(): only when OCR runs AND the frame is clock-valid (see module
          docstring); advances the periodic-refresh cadence.
-      3. observe_full(texts, frame_height) after a clock-valid full pass, or
-         read_cached(...) instead. Clock-less frames never touch the window or the cache.
+      3. observe_full(texts) after a clock-valid full pass, or read_cached(...) instead.
+         Clock-less frames never touch the window or the cache.
+
+    Build one with ``for_bands`` (the overlay bands); ``regions`` maps each region's name to
+    its calibration state.
     """
 
-    def __init__(self, bottom_frac: float = OVERLAY_BOTTOM_FRAC) -> None:
-        # `bottom_frac` mirrors pipeline.detect_text's bottom crop, which a shrunk capture
-        # widens below the default 0.92 to reach lifted in-game nametags (see
-        # tags.INGAME_TAG_BAND_FRAC_DEFAULT); the cache must cache the same region it OCRs.
-        self.bands = {"top": _BandState(0.0, TAG_TOP_FRAC),
-                      "bottom": _BandState(bottom_frac, 1.0)}
+    def __init__(self, regions: dict[str, Rect]) -> None:
+        self.regions = {name: _RegionState(rect) for name, rect in regions.items()}
         self._events_since_full = 0
         self._force_remaining = 0      # pending forced full passes (new game / empty-streak)
         # Clock-transition tracking (mirrors the splitter's own thresholds).
         self._last_valid_secs: float | None = None
         self._last_valid_ts: float | None = None
         self._invalid_streak = 0
+
+    @classmethod
+    def for_bands(cls, frame_width: int, frame_height: int,
+                  bottom_frac: float = OVERLAY_BOTTOM_FRAC,
+                  top: bool = True, bottom: bool = True) -> "OcrRoiCache":
+        """The overlay bands, mirroring pipeline.detect_text's crops exactly (same int()
+        rounding, via vodparse.overlay_bands.band_boxes). `bottom_frac` is detect_text's
+        bottom crop, which a shrunk capture widens below the default 0.92 to reach lifted
+        in-game nametags (see tags.INGAME_TAG_BAND_FRAC_DEFAULT); the cache must cache the
+        same region it OCRs.
+
+        `top` / `bottom` are the run's band plan (overlay_bands.band_ocr_plan): a band the
+        run does not OCR is left out, so the cache can never serve reads from a region the
+        full pass never observes. At least one of them must be set."""
+        if not (top or bottom):
+            raise ValueError("a band cache needs at least one band")
+        boxes = band_boxes(frame_width, frame_height, top=top, bottom=bottom,
+                           bottom_frac=bottom_frac)
+        regions: dict[str, Rect] = {
+            name: (x1, y1, x2, y2) for name, (x1, y1, x2, y2) in boxes.items()
+        }
+        return cls(regions)
 
     # ── New-game detection (the refresh trigger that tracks string changes) ──
 
@@ -248,60 +287,55 @@ class OcrRoiCache:
     # ── Full-vs-cached decision ──
 
     def should_run_full(self) -> bool:
-        """True when this event must pay for the full CRAFT pass: any band not yet settled
-        (still calibrating, or full of churning boxes that never stabilize: that band simply
+        """True when this event must pay for the full CRAFT pass: any region not yet settled
+        (still calibrating, or full of churning boxes that never stabilize: that region simply
         keeps today's full-pass behavior), forced refreshes pending, or the periodic sanity
         cadence coming due."""
         self._events_since_full += 1
-        unsettled = any(not (b.steady or b.empty) for b in self.bands.values())
+        unsettled = any(not (r.steady or r.empty) for r in self.regions.values())
         if unsettled or self._force_remaining > 0 or self._events_since_full >= REFRESH_EVERY:
             self._force_remaining = max(0, self._force_remaining - 1)
             self._events_since_full = 0
             return True
         return False
 
-    def observe_full(self, texts: list[TextBox], frame_height: int) -> None:
-        """Feed a full pass's detections (full-frame coords, both bands mixed) into the
-        per-band windows. detect_text's band crop guarantees every box lands in exactly one."""
-        for band in self.bands.values():
-            y_lo = frame_height * band.y0_frac
-            y_hi = frame_height * band.y1_frac
-            boxes = [_hull(t["bbox"]) for t in texts
-                     if y_lo <= sum(p[1] for p in t["bbox"]) / len(t["bbox"]) < y_hi]
-            band.observe(boxes, frame_height)
+    def observe_full(self, texts: list[TextBox]) -> None:
+        """Feed a full pass's detections (full-frame coords, every region's mixed) into the
+        per-region windows, each read going to the region holding its center. The full
+        pass crops exactly the regions, so every box lands in one (regions never overlap)."""
+        for region in self.regions.values():
+            region.observe([_hull(t["bbox"]) for t in texts if region.contains(t)])
 
     # ── Steady-state read ──
 
-    def read_cached(self, ocr: "easyocr.Reader", frame: np.ndarray, conf_threshold: float,
-                    decoder: str = "greedy") -> list[TextBox]:
-        """Recognizer-only read of every band's cached regions (CRAFT skipped: the same
-        trick timer.read_timer_at_bbox uses on the clock crop). Empty bands cost nothing.
-        Reported bboxes are the stable hulls, not the padded read regions (see module doc)."""
-        frame_height = frame.shape[0]
-        out: list[TextBox] = []
-        for band in self.bands.values():
-            if not band.steady:
-                continue    # empty band: nothing has ever been here to read
-            y_off = int(frame_height * band.y0_frac)
-            grey = cv2.cvtColor(frame[y_off:int(frame_height * band.y1_frac)],
-                                cv2.COLOR_BGR2GRAY)
-            # easyocr horizontal_list entries are [x_min, x_max, y_min, y_max], band-local.
-            boxes = [[r.read[0], r.read[2], r.read[1] - y_off, r.read[3] - y_off]
-                     for r in band.rois]
+    def read_cached(self, engine: OverlayOcr, frame: np.ndarray, conf_threshold: float,
+                    beamsearch: bool = False) -> dict[str, list[TextBox]]:
+        """Recognizer-only read of every region's cached boxes (text detection skipped: the
+        same trick timer.read_timer_at_bbox uses on the clock crop), keyed by region name.
+        Empty regions cost nothing. Reported bboxes are the cached hulls in full-frame
+        coordinates, not the padded read regions (see module doc)."""
+        out: dict[str, list[TextBox]] = {}
+        for name, region in self.regions.items():
+            out[name] = []
+            if not region.steady:
+                continue    # empty region: nothing has ever been here to read
+            x_off, y_off, x_hi, y_hi = region.region
+            crop = frame[y_off:y_hi, x_off:x_hi]
+            local = [(r.read[0] - x_off, r.read[1] - y_off, r.read[2] - x_off, r.read[3] - y_off)
+                     for r in region.rois]
             found = 0
             for roi, (_, text, conf) in zip(
-                    band.rois, ocr.recognize(grey, horizontal_list=boxes, free_list=[],
-                                             decoder=decoder, paragraph=False)):
+                    region.rois, engine.recognize_boxes(crop, local, beamsearch=beamsearch)):
                 if conf < conf_threshold or not text.strip():
                     continue
                 found += 1
                 x0, y0, x1, y1 = roi.box
-                out.append({"text": text.strip(), "confidence": round(float(conf), 3),
-                            "bbox": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]})
-            # A band that reliably produced text going silent means the strings moved or the
-            # overlay went away: schedule a full pass to find out instead of trusting it.
-            band.empty_streak = band.empty_streak + 1 if found == 0 else 0
-            if band.empty_streak >= EMPTY_STREAK_LIMIT:
-                band.empty_streak = 0
+                out[name].append({"text": text.strip(), "confidence": round(float(conf), 3),
+                                  "bbox": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]})
+            # A region that reliably produced text going silent means the strings moved or
+            # the overlay went away: schedule a full pass to find out instead of trusting it.
+            region.empty_streak = region.empty_streak + 1 if found == 0 else 0
+            if region.empty_streak >= EMPTY_STREAK_LIMIT:
+                region.empty_streak = 0
                 self._force_remaining = max(self._force_remaining, 1)
         return out

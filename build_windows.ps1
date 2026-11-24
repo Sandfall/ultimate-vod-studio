@@ -42,7 +42,13 @@ Write-Host "==> Installing the package + GUI deps"
 # Pin to the SAME versions that in-app installer fetches (vodparse.gpu_support.TORCH_VERSION /
 # TORCHVISION_VERSION) so the CUDA swap is an exact, ABI-matched replacement: keep them in step.
 & $Py -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
-& $Py -m pip install -e ".[gui]"
+# PyQt6 and its Qt runtime are pinned to the versions the app is developed and tested on.
+# pyproject leaves PyQt6 unpinned (right for a pip install), so an unpinned build takes
+# whatever is newest that day: in 2026-11 that was PyQt6 6.12.1 on Qt 6.12.0, a Qt that no
+# test or Windows check had run on. When bumping: run the tests and check video playback
+# on Windows with the new version first, and keep build_mac.sh and
+# .github/workflows/ci.yml in step.
+& $Py -m pip install -e ".[gui]" "PyQt6==6.11.0" "PyQt6-Qt6==6.11.2" "PyQt6-sip==13.11.1"
 
 # Pin the one dependency whose LICENSING changes with the version. opencv-python vendors an
 # FFmpeg build per platform (LGPL-2.1 here, GPL-3.0 in the macOS wheels), and NOTICE's
@@ -52,9 +58,17 @@ Write-Host "==> Installing the package + GUI deps"
 # constraint in someone else's metadata, which a doctr bump can drop without notice. Pin it
 # here instead, so NOTICE describes what ships because the build says so.
 # When bumping: read the new wheel's configure lines out of licenses\FFMPEG-BUILD-CONFIG.txt
-# after a build, and update NOTICE section 4 to match before shipping.
+# after a build, and update NOTICE section 3 to match before shipping.
 Write-Host "==> Pinning opencv-python to the version NOTICE describes"
-& $Py -m pip install "opencv-python==4.13.0.92"
+# easyocr requires opencv-python-headless, which installs into the same cv2\ folder as
+# opencv-python: two wheels, possibly of different versions, overwriting each other's
+# files, and a second OpenCV in the license documents that the app never loads. Keep
+# exactly one. Removing the headless wheel deletes the cv2\ files the two share, so the
+# pinned wheel is then force-reinstalled to put them back. --no-deps: its only
+# dependency, numpy, is already installed.
+& $Py -m pip uninstall -y opencv-python-headless
+& $Py -m pip install --force-reinstall --no-deps "opencv-python==4.13.0.92"
+if ($LASTEXITCODE -ne 0) { throw "could not reinstall the pinned opencv-python" }
 
 Write-Host "==> Installing PyInstaller + imageio-ffmpeg"
 & $Py -m pip install pyinstaller imageio-ffmpeg
@@ -127,7 +141,7 @@ if ($stagedDoctr.Count -lt 2) {
 Remove-Item Env:TQDM_DISABLE
 Remove-Item Env:DOCTR_CACHE_DIR
 
-# Download weights\{timer,character,m_char}.pt from the project's GitHub Release. weights\
+# Download the model weights (vodparse.games.shipped_weight_files) from the GitHub Release. weights\
 # itself is gitignored, so a fresh checkout (and every CI runner) starts with nothing there:
 # without this step UltimateVODStudio.spec silently skips every missing weight and ships an
 # app that can't detect or read anything. Stdlib-only, so it runs fine with the build venv's
@@ -147,5 +161,6 @@ Write-Host "==> Freezing with PyInstaller"
 Write-Host ""
 Write-Host "==> Done. Build is at: dist\UltimateVODStudio\"
 Write-Host "    Launch:   dist\UltimateVODStudio\'Ultimate VOD Studio.exe'"
-Write-Host "    Outputs (json_output\, video_out\) go to: %USERPROFILE%\Ultimate VOD Studio"
-Write-Host "    Override that with:  `$env:ULTIMATE_VOD_WORKSPACE = 'C:\path'"
+Write-Host "    Workspace (json_output\, drafts) goes to: %LOCALAPPDATA%\Ultimate VOD Studio"
+Write-Host "    Exported clips default to: %USERPROFILE%\Videos\Ultimate VOD Studio"
+Write-Host "    Override the workspace with:  `$env:ULTIMATE_VOD_WORKSPACE = 'C:\path'"

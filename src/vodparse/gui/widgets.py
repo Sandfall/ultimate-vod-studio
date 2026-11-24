@@ -8,13 +8,18 @@ import sys
 from collections.abc import Sequence
 from typing import override
 
-from PyQt6.QtCore import QEvent, QSize, Qt
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPaintEvent, QPixmap
-from PyQt6.QtWidgets import QApplication, QStackedWidget, QStyle, QToolButton, QWidget
+from PyQt6.QtCore import QEvent, QSize, Qt, QTimer
+from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QHelpEvent, QPainter, QPaintEvent,
+                         QPalette, QPixmap)
+from PyQt6.QtWidgets import (QApplication, QComboBox, QStackedWidget, QStyle,
+                             QStyleOptionComboBox, QStylePainter, QToolButton, QToolTip,
+                             QWidget)
 
 GLYPH_PT_BUMP = 12   # points added to the base font so the header glyph reads as an icon, not text
 HEADER_BTN_PAD = 2   # px of breathing room around the glyph on each side of its square button
 WIN_SYMBOL_FONT = "Segoe UI Symbol"  # monochrome Windows symbol font; has ⚙ ⚒ ⟳ (avoids Segoe UI Emoji)
+COMBO_ELIDE_SAFETY_PX = 2  # px a shortened combo label is kept clear of where clipping would start
+COMBO_LIST_ITEM_PAD = 6  # px allowed on each side of an item's text in a combo's drop-down list
 
 
 class FittingStack(QStackedWidget):
@@ -35,6 +40,139 @@ class FittingStack(QStackedWidget):
     def minimumSizeHint(self) -> QSize:
         page = self.currentWidget()
         return page.minimumSizeHint() if page is not None else super().minimumSizeHint()
+
+
+class ElidingComboBox(QComboBox):
+    """A QComboBox that ends its current item's text with "…" when the closed combo is too
+    narrow to show it all. Qt's own combo simply clips the text there, mid-letter, which
+    reads as a rendering fault; this is for a combo whose width is capped (see
+    ``combo_width_for_chars``) while its items can be any length. The drop-down list is
+    not touched: ``widen_popup_to_fit_items`` is what lets it show the items in full.
+
+    Its minimum is its size hint, up to its maximum width (see ``minimumSizeHint``): a
+    layout short of room shrinks something else, or the window grows, before this combo
+    has to cut a name its cap would let it show whole.
+
+    While its text is cut short, hovering the closed combo shows the whole text as a
+    tooltip (see ``tooltip_text``), as an ElidingLabel does."""
+
+    @override
+    def minimumSizeHint(self) -> QSize:
+        """As wide as the size hint, up to the combo's maximum width.
+
+        QComboBox works its own minimum out from its items the first time it is asked and
+        never again, and a layout gives a widget at least its minimum. So a combo that held
+        a long item at that moment would stay that wide for good, even after the item is
+        deleted or another list is loaded into it. The size hint does not have that
+        problem: Qt works it out again whenever the items change (for a combo that adjusts
+        to its contents), so a minimum taken from it follows the items in both directions.
+        Capped at the maximum width because a name longer than the cap is cut short with
+        "…" anyway, so there is no point asking for more room than the combo may take."""
+        qt_minimum = super().minimumSizeHint()
+        return QSize(min(self.sizeHint().width(), self.maximumWidth()), qt_minimum.height())
+
+    @override
+    def paintEvent(self, e: QPaintEvent | None) -> None:
+        """Paint the combo as QComboBox does (its frame and arrow, then its label), with the
+        label's text shortened to fit the space the style gives it."""
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        painter = QStylePainter(self)
+        painter.setPen(self.palette().color(QPalette.ColorRole.Text))
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
+        option.currentText = self.shown_text()
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, option)
+
+    @override
+    def event(self, e: QEvent | None) -> bool:
+        """Answer a tooltip request with ``tooltip_text`` (the whole text while it is cut
+        short). Worked out when the tooltip is asked for, so it never lags behind a change
+        of item or width. Every other event goes to QComboBox as usual."""
+        if e is not None and e.type() == QEvent.Type.ToolTip and isinstance(e, QHelpEvent):
+            text = self.tooltip_text()
+            if text:
+                QToolTip.showText(e.globalPos(), text, self)
+            else:
+                QToolTip.hideText()
+                e.ignore()
+            return True
+        return super().event(e)
+
+    def tooltip_text(self) -> str:
+        """What hovering the closed combo shows: the current item's whole text while
+        ``shown_text`` has cut it short, else the combo's own tooltip (empty unless one was
+        set)."""
+        text = self.currentText()
+        if self.shown_text() != text:
+            return text
+        return self.toolTip()
+
+    def shown_text(self) -> str:
+        """The current item's text as the closed combo draws it at its present width: whole
+        when it fits, else cut short and ended with "…".
+
+        Whether it fits is judged from the combo's own width, not from the style's text
+        area: each style insets the label by a different, unpublished amount (the Windows 11
+        style most of all), but every style can show a text whole in a combo as wide as it
+        would size one for that text. However many pixels the combo falls short of that
+        width is how many the text has to lose.
+
+        The text is measured the way QComboBox measures an item to size itself: by its
+        ``boundingRect`` (the width of its ink), not its ``horizontalAdvance``, which also
+        counts the space after the last letter and so usually comes out a pixel or two
+        wider. With the advance, a combo exactly as wide as Qt sized it for its text would
+        fall short by those pixels and cut a letter."""
+        text = self.currentText()
+        metrics = self.fontMetrics()
+        text_width = metrics.boundingRect(text).width()
+        shortfall = combo_width_for_text_width(self, text_width) - self.width()
+        if shortfall <= 0:
+            return text
+        return metrics.elidedText(
+            text, Qt.TextElideMode.ElideRight, text_width - shortfall - COMBO_ELIDE_SAFETY_PX)
+
+
+class PopupPickComboBox(ElidingComboBox):
+    """An ElidingComboBox that can tell a pick made in its popup list from every other way its
+    current index moves: the arrow keys, the mouse wheel or type-ahead on the closed box,
+    or a programmatic change. For a combo that carries an action item (the Overlay layout
+    combo's "New layout…"): the action should run when the user picks it, never because a
+    key press happened to land on it. Qt's own ``activated`` signal cannot tell the two
+    apart; it fires for the keys and the wheel as well.
+
+    How: on a pick Qt first closes the popup (``hidePopup``), then changes the index (unless
+    the picked item is already current) and emits ``activated``, all inside one event, and
+    nothing else closes the popup and does either within one event. So ``hidePopup`` raises
+    a flag that lasts until control returns to the event loop, and the owner's
+    ``currentIndexChanged`` or ``activated`` handler asks ``picked_from_popup()``; only
+    ``activated`` hears a pick of the item already current. Dismissing the popup (Escape, a
+    click elsewhere) changes no index and emits nothing, so the flag lapses unread."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._popup_just_closed = False
+
+    def picked_from_popup(self) -> bool:
+        """Whether the index change or ``activated`` being handled right now came from a
+        pick in the popup."""
+        return self._popup_just_closed
+
+    @override
+    def hidePopup(self) -> None:
+        """Close the popup and, when one was up, remember that until the event loop runs
+        again (a pick's index change follows before then). Raised only once the base call
+        returns, in case a style closes the popup with a nested event loop, which would run
+        the reset before the index changes."""
+        view = self.view()
+        popup_was_up = view is not None and view.isVisible()
+        super().hidePopup()
+        if popup_was_up:
+            self._popup_just_closed = True
+            QTimer.singleShot(0, self._forget_popup_close)
+
+    def _forget_popup_close(self) -> None:
+        """Back in the event loop: whatever moves the index from here on is not that pick."""
+        self._popup_just_closed = False
 
 
 class GlyphButton(QToolButton):
@@ -80,6 +218,51 @@ class GlyphButton(QToolButton):
         # at the screen's pixel ratio, independent of any dpr metadata.
         painter.drawPixmap(self.rect(), self._glyph_pixmap)
         painter.end()
+
+
+def combo_width_for_text_width(combo: QComboBox, text_width: int) -> int:
+    """The width `combo` asks for to show an item whose text is `text_width` px wide in
+    full: the text plus the frame and drop-down arrow the current style draws around it.
+    The same sum QComboBox does to size itself to its items."""
+    option = QStyleOptionComboBox()
+    option.initFrom(combo)
+    option.editable = combo.isEditable()
+    option.frame = combo.hasFrame()
+    text_size = QSize(text_width, combo.fontMetrics().height())
+    style = combo.style()
+    assert style is not None  # a widget always has a style
+    return style.sizeFromContents(
+        QStyle.ContentsType.CT_ComboBox, option, text_size, combo).width()
+
+
+def combo_width_for_chars(combo: QComboBox, chars: int) -> int:
+    """The width `combo` asks for to show an item `chars` characters long in full (see
+    ``combo_width_for_text_width``). Counted the way QComboBox counts a minimum contents
+    length, in widths of the letter "x", so a real name of that many characters fits unless
+    it is unusually wide. For capping a combo that grows with its contents:
+    ``combo.setMaximumWidth(combo_width_for_chars(combo, 22))``."""
+    return combo_width_for_text_width(combo, combo.fontMetrics().horizontalAdvance("x" * chars))
+
+
+def widen_popup_to_fit_items(combo: QComboBox) -> None:
+    """Let `combo`'s drop-down list be as wide as its longest item, even when the closed
+    combo is narrower (a combo with a maximum width cuts a long current item short with
+    "…", and the list is where the names can still be read in full). Call again whenever the
+    items change. Some styles (macOS, Fusion) size the list to its items by themselves;
+    the Windows styles make it exactly as wide as the combo, which this overrides."""
+    view = combo.view()
+    style = combo.style()
+    assert view is not None and style is not None  # a combo always has both
+    # Measured from the item texts rather than asked of the view (sizeHintForColumn): under
+    # the styles that draw the list as a menu, the view answers with far less than a long
+    # item needs.
+    metrics = view.fontMetrics()
+    longest_text_width = max(
+        (metrics.horizontalAdvance(combo.itemText(index)) for index in range(combo.count())),
+        default=0)
+    scroll_bar_width = style.pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+    view.setMinimumWidth(longest_text_width + 2 * COMBO_LIST_ITEM_PAD
+                         + 2 * view.frameWidth() + scroll_bar_width)
 
 
 def make_icon_button(glyph: str, tooltip: str, fallback: QStyle.StandardPixmap) -> QToolButton:

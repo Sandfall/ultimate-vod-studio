@@ -48,11 +48,16 @@ jobs:
         run: |
           set -euo pipefail
           internal=dist/UltimateVODStudio/_internal
-          pts=$(find "$internal/weights" -maxdepth 1 -name '*.pt' | wc -l | tr -d ' ')
-          if [ "$pts" -ne 3 ]; then
-              echo "expected 3 bundled weights (timer/character/m_char), found $pts" >&2
-              exit 1
-          fi
+          # One check per weight the game registry declares (vodparse.games.shipped_weight_files),
+          # by name rather than by count, so the failure says which one went missing. Keep this
+          # list in step with the registry when a game gains or loses a model.
+          for name in timer.pt character.pt m_char.pt \
+                      timer_dx.pt rivals2_timer.pt character_dx.pt; do
+              if [ ! -f "$internal/weights/$name" ]; then
+                  echo "bundled weight missing: $name (expected under $internal/weights)" >&2
+                  exit 1
+              fi
+          done
           # The docTR text-engine models (spec destination doctr_models/models/): detector
           # + recognizer.
           doctr=$(find "$internal/doctr_models/models" -maxdepth 1 -name '*.pt' | wc -l | tr -d ' ')

@@ -28,6 +28,9 @@ _STAGE_MODULES = frozenset({
     "vodparse.cli.export_diagnostics",
     "vodparse.cli.gpu_support",
     "vodparse.cli.doctr_support",
+    "vodparse.cli.overlay_read",
+    "vodparse.cli.clock_locate",
+    "vodparse.cli.side_overlay_locate",
 })
 
 

@@ -109,6 +109,56 @@ def _install_in_flight() -> bool:
     return _install_owner is not None and qobject_alive(_install_owner)
 
 
+# ── Letting go of the CUDA site while it is replaced ─────────────────────────────────
+# The uninstaller in flight, or None: an install's is _install_owner's. Module-wide like that
+# guard, so site_swap_in_flight answers for every manager.
+_uninstall_proc: QProcess | None = None
+
+
+class _SiteSwapNotifier(QObject):
+    """Carries the two signals behind :func:`connect_site_swap`."""
+
+    swap_starting = pyqtSignal()
+    swap_ended = pyqtSignal()
+
+
+# The one notifier every manager emits through (several managers run at once: see
+# _install_owner). Created on first use.
+_site_swap_notifier: _SiteSwapNotifier | None = None
+
+
+def _notifier() -> _SiteSwapNotifier:
+    global _site_swap_notifier
+    if _site_swap_notifier is None:
+        _site_swap_notifier = _SiteSwapNotifier()
+    return _site_swap_notifier
+
+
+def connect_site_swap(release: Callable[[], None], resume: Callable[[], None]) -> None:
+    """Call ``release`` right before any GPU-support install or uninstall starts, whichever
+    manager starts it, and ``resume`` once it has ended (finished, failed or cancelled).
+
+    Windows refuses to rename or delete a folder while a process has a DLL from it loaded, and
+    the installer replaces ``site/`` by renaming it (vodparse.cli.gpu_support). With a video
+    loaded, the preview's long-lived OCR helper holds the CUDA torch it imported from there, so
+    every reinstall failed with "Access is denied" (round-3 Windows testing). A long-lived
+    helper's ``release`` stops it, and it starts no new one while :func:`site_swap_in_flight`
+    (the download alone takes about a minute); ``resume`` lets it pick up what it held back,
+    from whichever torch is then installed. Connect bound methods of a QObject, so the
+    connections end when that object is destroyed. A run or a search still in flight can block
+    the swap too: those end on their own, and the failure dialog shows the installer's error."""
+    notifier = _notifier()
+    notifier.swap_starting.connect(release)
+    notifier.swap_ended.connect(resume)
+
+
+def site_swap_in_flight() -> bool:
+    """True while any manager in this process has an installer or uninstaller running: the
+    window in which nothing may load the CUDA torch (see connect_site_swap)."""
+    uninstalling = _uninstall_proc is not None and qobject_alive(_uninstall_proc)
+    return _install_in_flight() or uninstalling
+
+
 def _invalidate_probe_cache() -> None:
     """Forget this session's cached compute-status probe and mark in-flight probes stale. Called
     whenever the install set changes (any install or uninstall) so the next probe: and any
@@ -303,6 +353,7 @@ class GpuSupportManager(QObject):
         proc.finished.connect(self._on_install_finished)
         proc.errorOccurred.connect(self._on_install_error)
         dialog.canceled.connect(self._cancel_install)
+        _notifier().swap_starting.emit()   # the swap renames site/: nothing of ours may hold its DLLs
         proc.start(sys.executable, argv)
         dialog.show()
 
@@ -354,6 +405,7 @@ class GpuSupportManager(QObject):
         self._install = None
         if _install_owner is self:
             _install_owner = None
+        _notifier().swap_ended.emit()   # after the guard clears: site_swap_in_flight is False
         if qobject_alive(install.dialog):
             # QProgressDialog emits canceled() from its closeEvent, so drop the connection
             # first: otherwise this close would re-enter _cancel_install (today that's a
@@ -381,8 +433,10 @@ class GpuSupportManager(QObject):
             _discard_staging()  # a failed installer usually cleans up; cover the paths it can't
             tail = "\n".join(install.output.strip().splitlines()[-8:])
             QMessageBox.warning(
-                self._parent_widget, "GPU support install failed",
-                "The GPU support download didn't complete. The app will keep using the CPU.\n\n"
+                self._parent_widget, "Couldn't install GPU acceleration",
+                # Not "the download failed": the swap into site/ can fail after a complete
+                # download (a torch DLL still loaded), and the installer's lines say which.
+                "GPU acceleration couldn't be installed. The app will keep using the CPU.\n\n"
                 f"{tail or 'The installer exited with an error.'}")
 
     # ── Uninstall ────────────────────────────────────────────────────────────────────
@@ -399,15 +453,24 @@ class GpuSupportManager(QObject):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
+        global _uninstall_proc
         proc = QProcess(self)
         proc.setProcessEnvironment(stage_environment())
         fired = False  # finished + errorOccurred can both arrive; run the completion once
 
         def _done(code: int) -> None:
+            global _uninstall_proc
             nonlocal fired
-            if fired or not qobject_alive(proc):  # panel/dialog closed before the (fast) uninstall returned
+            if fired:
                 return
             fired = True
+            if _uninstall_proc is proc:
+                _uninstall_proc = None
+            # End the hold before the liveness check: with Settings closed mid-uninstall,
+            # finished arrives from the dead QProcess, and the preview still needs to resume.
+            _notifier().swap_ended.emit()
+            if not qobject_alive(proc):   # panel/dialog closed before the (fast) uninstall returned
+                return
             proc.deleteLater()
             self._finish_uninstall(code)
 
@@ -416,6 +479,8 @@ class GpuSupportManager(QObject):
         # nothing. Other errors do finish, and the once-guard keeps them single-delivery.
         proc.errorOccurred.connect(
             lambda err: _done(1) if err == QProcess.ProcessError.FailedToStart else None)
+        _uninstall_proc = proc
+        _notifier().swap_starting.emit()   # the uninstall deletes site/: nothing of ours may hold its DLLs
         proc.start(sys.executable, ["-m", _INSTALL_MODULE, "uninstall"])
 
     def _finish_uninstall(self, code: int) -> None:
@@ -506,9 +571,10 @@ class GpuSupportManager(QObject):
         notice plus the ``no_gpu_found`` signal (none found), or nothing (cancelled or the
         probe failed: both retry next launch, so neither persists anything). Also the Debug
         menu's "Run first-run GPU offer" hook, which is why there is no platform/frozen guard
-        here: off Windows or from a source checkout the probe still runs and offer_install
-        then shows its own explanatory refusal, which is exactly what a maintainer previewing
-        the flow wants to see."""
+        here: on Linux or from a source checkout the probe still runs and offer_install then
+        shows its own explanatory refusal, which is exactly what a maintainer previewing the
+        flow wants to see. (The Debug menu leaves the hook out on macOS, where the Apple GPU
+        is built in and the "runs on the CPU" notice would be wrong.)"""
         if _install_in_flight():
             # Same reasoning as offer_install: the install's progress dialog is already
             # visible feedback, and offering again could start a second installer.

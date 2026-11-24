@@ -17,7 +17,7 @@ The Review screen's draft format (review_draft.json) is GUI-internal and lives w
 serializers in vodparse.gui.review.draft (`clip_to_draft` / `match_to_draft`).
 """
 
-from typing import TypedDict
+from typing import Any, NotRequired, TypedDict
 
 BBox = list[int]            # [x1, y1, x2, y2]
 QuadBBox = list[list[int]]  # [[x, y], [x, y], [x, y], [x, y]]
@@ -58,8 +58,11 @@ class _TimerReadingBase(ParsedTime):
 class TimerReading(_TimerReadingBase, total=False):
     """As above; `recovered` is set True only when the reading came from the dropped-read
     fallback (timer.detect_timer_with_recovery): the clock OCR'd at a remembered box because
-    the detector missed it, rather than from a real detector box."""
+    the detector missed it, rather than from a real detector box. `calibrated` is set True
+    when it came from the run's calibrated clock box (vodparse.clock_calibration): the spot
+    the detector agreed on across the VOD, read on every sample like a drawn layout box."""
     recovered: bool
+    calibrated: bool
 
 
 class CharacterDetection(TypedDict):
@@ -67,6 +70,17 @@ class CharacterDetection(TypedDict):
     name: str
     confidence: float
     bbox: BBox
+
+
+class StockSlot(TypedDict):
+    """One HUD slot as read by stock_icons.detect_stock_icons: the character whose stock icons
+    fill it, how many icons (= stocks left) it shows, and the box around the whole row of
+    them in source-frame pixels. Slots are listed left to right, which is controller-port
+    order, so the first two are player 1 and player 2 in a 1v1."""
+    name: str
+    confidence: float
+    bbox: BBox
+    stocks: int
 
 
 class SideCharacters(TypedDict):
@@ -97,6 +111,19 @@ class _EventBase(Marker):
     label: str | None   # "go" | "game" | None (None = periodic OCR frame)
 
 
+class LayoutRead(TypedDict):
+    """What one overlay text box read on one frame (vodparse.layout_reads.read_region): the
+    text (empty when nothing was read) and the best single read's confidence. A player box
+    (a drawn gamertag box, or a row the side-bar pre-pass locked) reads its row through
+    tags.read_player_row, so its `text` is the gamertag alone and `sponsor` carries the
+    sponsor split off the row (None when the player has none); other regions join their
+    words as read and carry no `sponsor` key. Runs older than the key have none: their
+    votes fall back to splitting `text`."""
+    text: str
+    confidence: float
+    sponsor: NotRequired[str | None]
+
+
 class Event(_EventBase, total=False):
     """One pipeline.json event: a go/game splash detection or a periodic-OCR frame.
     `confidence`/`bbox` appear only on splash detections; `texts`/`timer`/`characters`
@@ -109,6 +136,13 @@ class Event(_EventBase, total=False):
     ocr_gated: bool      # True when the --gate-ocr-on-timer toggle skipped this frame's full-frame
                          # OCR (a timer-less "dead" frame); its texts are [] but it is still kept as
                          # a clock-less sample for intermission splitting / first-game-start anchoring
+    layout_reads: dict[str, LayoutRead]   # a custom overlay layout's text boxes, read per frame and
+                                          # keyed by region (overlay_layout.REGION_KEYS minus the
+                                          # timer, which lands in `timer`); only on runs with a layout
+    stock_slots: list[StockSlot]  # every HUD slot the stock-icon detector found, left to right
+                                  # (stock_icons.detect_stock_icons); only on runs with that
+                                  # detector, where an empty list means the strip showed no icons.
+                                  # `characters` carries the first two when exactly two were seen
 
 
 class _MatchBase(TypedDict):
@@ -177,6 +211,9 @@ class Clip(TypedDict):
     characters: list[str]
     round: str
     best_of: str
+    # The first game's start in the VOD, for the CSV's first_game_offset (the upload
+    # assistant's thumbnail). Absent in reviewed.json files written before 1.0.0.
+    first_game_sec: NotRequired[float]
 
 
 class _ReviewedBase(TypedDict):
@@ -214,11 +251,39 @@ class InferenceSettings(TypedDict):
     ocr_roi_cache: bool       # recognizer-only reads of calibrated text regions (ocr_roi.py)
     ocr_lang: str             # "en" or a non-English code paired with English (ocr_langs.py)
     ocr_engine: str           # overlay-band engine, "easyocr" | "doctr" (ocr_engine.py)
-    ingame_tag_band_frac: float   # in-game nametag OCR-band top edge; <0.92 widens it for shrunk
-                                  # captures (tags.INGAME_TAG_BAND_FRAC_DEFAULT); read back at extract
-    timer_model_path: str
-    character_model_path: str
+    ingame_band_ocr_engine: NotRequired[str]   # the engine that read the BOTTOM band when the
+                                               # game's HUD pins one (games.IngameHud.ocr_engine);
+                                               # absent or equal to ocr_engine = the overlay engine
+                                               # read it, or it was not read (band_ocr_bottom)
+    ingame_tag_band_frac: float   # top edge of the bottom OCR band = the game's in-game nameplate
+                                  # band (games.ingame_band_top_for); for Ultimate only, <0.92 means
+                                  # the widening knob for shrunk captures. Read back at extract
+    game: NotRequired[str]        # the game the run was analyzed as (a vodparse.games id);
+                                  # absent = a run predating the setting, i.e. Ultimate. Read
+                                  # back at extract for the game's in-game nameplate profile
+    # The detector weights the run loaded, or None for a game with no detectors of its own.
+    timer_model_path: str | None
+    character_model_path: str | None
+    stock_model_path: NotRequired[str | None]   # the stock-icon detector (games.GameWeights.
+                                                # stock_icons); absent = a run predating it
     seek_every: float     # 0 in go/game mode
+    # Which of the two overlay OCR bands the run read (overlay_bands.band_ocr_plan): False when
+    # nothing consumed that band (a custom layout's own boxes covered its readers, or the in-game
+    # band is read as nothing), so it was never OCR'd. Absent = an older run, which always read
+    # both bands. Extract reads band_ocr_bottom back (extract_matches.bottom_band_was_read).
+    band_ocr_top: NotRequired[bool]
+    band_ocr_bottom: NotRequired[bool]
+    overlay_regions: NotRequired[dict[str, Any]]   # the overlay text regions read per sample
+                                                   # (overlay_regions.OverlayRegions.as_config):
+                                                   # a layout's drawn boxes or the side-bar
+                                                   # lock's rows; absent = no regions were
+                                                   # read (built-in bands only), or a run
+                                                   # older than the key, whose layout record
+                                                   # below stands in for it at extract
+    overlay_layout: NotRequired[dict[str, Any]]   # the custom overlay layout the run read with, as
+                                                  # overlay_layout.layout_to_dict (name + boxes);
+                                                  # absent = the built-in overlay reading. Read
+                                                  # back at extract so both stages use one layout
 
 
 class PipelineConfig(TypedDict):
@@ -233,6 +298,20 @@ class PipelineConfig(TypedDict):
     duration_sec: float
     frame_width: int
     frame_height: int
+    elapsed_sec: NotRequired[float]   # wall time of the whole analysis run, for timing one run
+                                      # against another (GUI runs keep no console log); absent
+                                      # = an older run
+    clock_calibration: NotRequired[dict[str, Any] | None]
+    """The calibrated clock box the run read on every sample
+    (vodparse.clock_calibration.ClockCalibration.as_config), or None when the pre-pass found
+    no agreeing spot (or did not run: a drawn timer box, no clock detector, --no-calibrate-
+    clock); absent = an older run."""
+    side_overlay: NotRequired[dict[str, Any] | None]
+    """What the side-bar pre-pass concluded (vodparse.side_overlay.SideOverlayScan.as_config:
+    its status, the feed span, every row it weighed and the boxes it locked), or None when it
+    did not run (a game without side bars, a custom layout, --no-locate-overlay, no OCR);
+    absent = an older run. The locked boxes themselves are the run's
+    inference_settings.overlay_regions."""
     inference_settings: InferenceSettings
 
 
@@ -245,9 +324,45 @@ class PipelineData(TypedDict):
 class PipelineProgress(TypedDict):
     """The transient progress sidecar vodparse.cli.pipeline rewrites throughout a run (and deletes
     nothing: the GUI owns cleanup). The GUI polls it to drive the run's progress bar:
-    timestamp_sec is how far into the video the main loop has reached."""
+    timestamp_sec is how far into the video the main loop has reached. `stage` names a
+    phase before the main loop that the bar cannot express as a position: "calibrating"
+    while the clock-box pre-pass runs (vodparse.clock_calibration); absent once the loop
+    is under way, and on older pipelines. `clock_calibration` rides on every main-loop
+    tick so the GUI can show the outcome for the whole run: "found" (the box is being read
+    every sample), "not_found" (no agreeing spot: the detector reads each frame) or
+    "skipped" (a drawn timer box, no clock detector, or --no-calibrate-clock)."""
     timestamp_sec: float
     duration_sec: float
+    stage: NotRequired[str]
+    clock_calibration: NotRequired[str]
+    side_overlay: NotRequired[str]   # the side-bar pre-pass's outcome, one of
+                                     # side_overlay.SIDE_OVERLAY_STATUSES ("locked", "top_band",
+                                     # "not_found", "skipped"); rides on every main-loop tick like
+                                     # clock_calibration; stage "locating_overlay" while it runs
+
+
+# The values PipelineProgress carries: the pipeline writes them, the GUI's progress pane reads
+# them, and both import them from here (the GUI must not import vodparse.cli.pipeline).
+PROGRESS_STAGE_CALIBRATING = "calibrating"
+"""PipelineProgress.stage while the clock-box pre-pass runs, before the main loop."""
+
+PROGRESS_STAGE_LOCATING_OVERLAY = "locating_overlay"
+"""PipelineProgress.stage while the side-bar pre-pass runs (vodparse.side_overlay), after the
+clock-box pre-pass and before the main loop. Its outcome rides on every main-loop tick as
+PipelineProgress.side_overlay (one of side_overlay.SIDE_OVERLAY_STATUSES)."""
+
+CLOCK_CALIBRATION_FOUND = "found"
+CLOCK_CALIBRATION_NOT_FOUND = "not_found"
+CLOCK_CALIBRATION_SKIPPED = "skipped"
+"""PipelineProgress.clock_calibration values, one per main-loop tick."""
+
+# The pipeline's --ingame-band-engine choices: which engine reads a game's in-game nameplate
+# band when the game pins one of its own (games.ingame_band_engine_for; Rivals 2 pins docTR).
+# "pinned" loads the game's engine; "overlay" reads the band with --ocr-engine instead, which
+# is what the GUI asks for when the user declines the pinned engine's model download. Here,
+# not in vodparse.cli.pipeline, because the GUI builds the argv and must not import that.
+INGAME_BAND_ENGINE_PINNED = "pinned"
+INGAME_BAND_ENGINE_OVERLAY = "overlay"
 
 
 # ── Diagnostics bundle (manifest.json inside diagnostics_*.zip) ─────────────────

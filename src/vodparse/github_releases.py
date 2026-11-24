@@ -21,6 +21,8 @@ import json
 import urllib.request
 from http.client import HTTPResponse
 
+from vodparse import net
+
 # Base URL for the GitHub REST API. A module-level global (not a default parameter
 # value) so tests can redirect it to a local socket via monkeypatch and have that
 # redirect actually take effect on the next call (default parameter values are
@@ -57,9 +59,12 @@ def open_github_url(
     })
     if token:
         request.add_header("Authorization", f"Bearer {token}")
+    # Verify against the system roots plus certifi's bundle (see vodparse.net), so the
+    # update check and weight fetch don't depend on what the OS trust store has cached.
+    context = net.make_ssl_context()
     if timeout is None:
-        return urllib.request.urlopen(request)
-    return urllib.request.urlopen(request, timeout=timeout)
+        return urllib.request.urlopen(request, context=context)
+    return urllib.request.urlopen(request, timeout=timeout, context=context)
 
 
 def fetch_release_json(

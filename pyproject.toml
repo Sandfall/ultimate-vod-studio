@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vodparse"
-version = "0.9.1"
+version = "1.0.0"
 description = "YOLO + EasyOCR pipeline for analyzing tournament match VODs (logo, timer, and portrait detection)."
 readme = "README.md"
 # PEP 639 SPDX expression ("or later" per the NOTICE grant). License *classifiers* are
@@ -18,7 +18,7 @@ license-files = ["LICENSE", "NOTICE", "licenses/torchvision-LICENSE.txt"]
 # Name-only by design: the project is published pseudonymously with no contact email;
 # security reports go through GitHub's private vulnerability-reporting form.
 authors = [{ name = "Sandfall" }]
-keywords = ["ssbu", "vod", "video-analysis", "ocr", "yolo", "clip-export"]
+keywords = ["ssbu", "ssbm", "rivals2", "vod", "video-analysis", "ocr", "yolo", "clip-export"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: X11 Applications :: Qt",
@@ -57,6 +57,10 @@ dependencies = [
     # Runtime dep: vodparse.debug builds DataFrames for timer segment grouping (imported lazily
     # in segments_dataframe). ultralytics no longer pulls it in transitively, so declare it.
     "pandas",
+    # Runtime dep: vodparse.net loads certifi's CA bundle on top of the system roots so the
+    # app's own HTTPS downloads verify on a fresh Windows install. It was already in the tree
+    # transitively; declared here because the code now imports it by name.
+    "certifi",
 ]
 
 # Dev-only tooling (data generation, training, asset prep, type checking, linting).
@@ -72,6 +76,9 @@ dev = [
 # pip install -e ".[gui]"
 gui = [
     "PyQt6",
+    # The Qt runtime PyQt6 runs on. 6.11.1 crashes at launch on macOS 27.2: setting an
+    # application icon of 256 px or more segfaults (the app's is 1024 px); 6.11.2 is fixed.
+    "PyQt6-Qt6>=6.11.2",
 ]
 
 # Test-runner extra, for working on the project. Install with: pip install -e ".[test]"

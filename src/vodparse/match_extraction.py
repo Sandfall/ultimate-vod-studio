@@ -37,6 +37,24 @@ GAP_AWARE_END_ANCHOR = True
 IMPLAUSIBLE_TIMERS_NAME = "implausible_timers.json"
 
 
+def is_ocr_sample(event: Event) -> bool:
+    """Whether a periodic-OCR event carries anything the splitter must see, so it is kept as
+    one of a match's frames: band texts, a clock, the ocr_gated marker (--gate-ocr-on-timer
+    emptied its texts), or a custom overlay layout's box reads. A layout run writes
+    `layout_reads` on every un-gated sample even when its band plan OCR'd no band at all
+    (overlay_bands.band_ocr_plan retires a band the layout's boxes cover), so a clock-less
+    sample of such a run is exactly the intermission frame _looks_like_new_game and
+    _first_game_start rely on being present; dropping it would silently re-merge games.
+    A stock-icon read (`stock_slots`, written on every sample of a run with that detector)
+    counts too, an empty list included: it records that the stock detector looked at the
+    sample, and an empty one (no stock slots seen) is exactly an intermission frame. A layout
+    that draws only a timer box writes no `layout_reads`, so such a sample would otherwise
+    vanish. A sample with none of these saw nothing, and is left out as it always was."""
+    return bool(event.get("texts") or event.get("timer") or event.get("ocr_gated")
+                or event.get("layout_reads") is not None
+                or event.get("stock_slots") is not None)
+
+
 def extract_matches(events: list[Event]) -> list[Match]:
     """Group pipeline events into matches using the detected splash screens: a match opens at
     a "go" and closes at the next "game", keeping every OCR frame in between for later tag
@@ -71,11 +89,9 @@ def extract_matches(events: list[Event]) -> list[Match]:
 
         else:  # periodic OCR (label is None): keep if it falls inside an open match
             # Keep timer-bearing frames too (even with no texts) so a mid-match timer
-            # reset isn't dropped before split_on_timer_reset can see it. Also keep
-            # OCR-gated frames (--gate-ocr-on-timer dropped their texts): they carry no
-            # vote but mark a clock-less sample the splitter still needs.
-            if pending_start is not None and (event.get("texts") or event.get("timer")
-                                              or event.get("ocr_gated")):
+            # reset isn't dropped before split_on_timer_reset can see it, and the other
+            # clock-less samples the splitter still needs (see is_ocr_sample).
+            if pending_start is not None and is_ocr_sample(event):
                 between.append(event)
 
     if pending_start is not None:
@@ -86,62 +102,73 @@ def extract_matches(events: list[Event]) -> list[Match]:
 
 
 def extract_matches_timer_only(events: list[Event], sample_interval: float = DEFAULT_SAMPLE_INTERVAL_SEC,
-                               debug: bool = False, stem: str = "", stage: str = "") -> list[Match]:
+                               debug: bool = False, stem: str = "", stage: str = "", *,
+                               full_game_seconds: float = FULL_GAME_SECONDS,
+                               fighter_check: bool = True) -> list[Match]:
     """Build the list of matches using only the timer. This is for runs where the pipeline
     sampled frames on a fixed interval (--seek-every) and never detected the "go" / "game"
     screens that normally mark where a match begins and ends. Each time the clock jumps back
     up, a new game has started, so frames are grouped between those jumps.
+    `full_game_seconds` is the full match clock (Ultimate's 7:00 by default; pass a game's own
+    clock length for anything else), used to bound valid clock readings and back-calculate
+    game starts. `fighter_check` is whether an intermission cut may demand a detected fighter
+    (see _timer_reset_indices): False for a run without a character detector.
     Pass debug=True to print the frame/segment/game DataFrames from _build_games; stem/stage
     name its debug CSVs."""
-    # Keep any frame with text or a clock; also keep OCR-gated frames (--gate-ocr-on-timer
-    # emptied their texts): they carry no tag vote but are the clock-less samples the
-    # intermission splitter and _first_game_start rely on being present.
+    # Keep every frame that saw something (see is_ocr_sample: text, a clock, or the markers
+    # of a clock-less sample the intermission splitter and _first_game_start rely on).
     all_frames = _clean_timer_frames([e for e in events
-                                      if (e.get("texts") or e.get("timer") or e.get("ocr_gated"))
-                                      and e.get("label") not in ("go", "game")], stem=stem)
+                                      if is_ocr_sample(e) and e.get("label") not in ("go", "game")],
+                                     stem=stem, full_game_seconds=full_game_seconds)
     if not all_frames:
         return []
 
-    cuts = _timer_reset_indices(all_frames, sample_interval)
-    first_start = _first_game_start(all_frames)
+    cuts = _timer_reset_indices(all_frames, sample_interval, full_game_seconds=full_game_seconds,
+                                fighter_check=fighter_check)
+    first_start = _first_game_start(all_frames, full_game_seconds=full_game_seconds)
     if not cuts:
         return [{
             "duration_sec": round(all_frames[-1]["timestamp_sec"] - first_start["timestamp_sec"], 3),
             "start": first_start,
             "end": all_frames[-1],
-            "frames": _match_voting_frames(all_frames, first_start["timestamp_sec"]),
+            "frames": _match_voting_frames(all_frames, first_start["timestamp_sec"],
+                                           full_game_seconds=full_game_seconds),
         }]
 
     # No real go/game boundaries: the first game's start is back-calculated from its clock (so a
     # clock-less intro isn't glued on; see _first_game_start) and the last game's end is synthesized
     # (last_end=None). Trim trailing clock-less frames so post-game menus don't pollute tag voting.
     return _build_games(all_frames, cuts, first_start, None,
-                        sample_interval, trim_voting=True, debug=debug, stem=stem, stage=stage)
+                        sample_interval, trim_voting=True, debug=debug, stem=stem, stage=stage,
+                        full_game_seconds=full_game_seconds, fighter_check=fighter_check)
 
 
-def valid_secs(seconds: float | None) -> float | None:
-    """A timer reading only makes sense between 0 and 7:00 (the length of the match clock).
+def valid_secs(seconds: float | None, full_game_seconds: float = FULL_GAME_SECONDS) -> float | None:
+    """A timer reading only makes sense between 0 and the full match clock length
+    (`full_game_seconds`: Ultimate's 7:00 by default, or a game's own clock length).
     Anything outside that range is an OCR mistake, so return None as if there were no reading."""
-    return seconds if (seconds is not None and 0 <= seconds <= FULL_GAME_SECONDS) else None
+    return seconds if (seconds is not None and 0 <= seconds <= full_game_seconds) else None
 
 
-def timer_sec(frame: Event) -> float | None:
+def timer_sec(frame: Event, full_game_seconds: float = FULL_GAME_SECONDS) -> float | None:
     """The frame's timer reading in seconds remaining, or None if it has no valid timer."""
     timer = frame.get("timer")
-    return valid_secs(timer.get("total_seconds")) if timer else None
+    return valid_secs(timer.get("total_seconds"), full_game_seconds) if timer else None
 
 
-def _timer_readings(frames: list[Event]) -> list[tuple[int, float, float]]:
+def _timer_readings(frames: list[Event],
+                    full_game_seconds: float = FULL_GAME_SECONDS) -> list[tuple[int, float, float]]:
     """(index, seconds-remaining, timestamp) for every non-go/game frame with a valid clock.
     go/game frames are skipped because their full-screen graphic can obscure the clock."""
     return [(index, seconds, frames[index]["timestamp_sec"])
             for index, frame in enumerate(frames)
             if frame.get("label") not in ("go", "game")
-            and (seconds := timer_sec(frame)) is not None]
+            and (seconds := timer_sec(frame, full_game_seconds)) is not None]
 
 
 def _looks_like_new_game(prev: tuple[int, float, float], cur: tuple[int, float, float],
-                         frames: list[Event], sample_interval: float) -> tuple[bool, bool]:
+                         frames: list[Event], sample_interval: float,
+                         full_game_seconds: float = FULL_GAME_SECONDS) -> tuple[bool, bool]:
     """The splitter's two new-game signals between consecutive clock readings (each an
     (index, seconds, timestamp) triple from _timer_readings over `frames`):
 
@@ -161,11 +188,63 @@ def _looks_like_new_game(prev: tuple[int, float, float], cur: tuple[int, float, 
     cur_index, cur_seconds, cur_ts = cur
     jumped_up = cur_seconds - prev_seconds > RESET_JUMP_SEC
     intermission = (cur_seconds - prev_seconds > TIMER_DROP_TOLERANCE_SEC
-                    and cur_ts - prev_ts >= INTERMISSION_MIN_SAMPLES * sample_interval
-                    and any(frames[b].get("label") not in ("go", "game")
-                            and timer_sec(frames[b]) is None
-                            for b in range(prev_index + 1, cur_index)))
+                    and _clockless_gap_between(prev, cur, frames, sample_interval,
+                                               full_game_seconds))
     return jumped_up, intermission
+
+
+def _clockless_gap_between(prev: tuple[int, float, float], cur: tuple[int, float, float],
+                           frames: list[Event], sample_interval: float,
+                           full_game_seconds: float = FULL_GAME_SECONDS) -> bool:
+    """Whether a clock-less intermission separates two consecutive clock readings (each an
+    (index, seconds, timestamp) triple from _timer_readings over `frames`): at least
+    INTERMISSION_MIN_SAMPLES sample intervals apart, with a sampled frame between them that
+    showed no clock. More than a single dropped OCR read, at any OCR cadence."""
+    prev_index, _, prev_ts = prev
+    cur_index, _, cur_ts = cur
+    return (cur_ts - prev_ts >= INTERMISSION_MIN_SAMPLES * sample_interval
+            and any(frames[b].get("label") not in ("go", "game")
+                    and timer_sec(frames[b], full_game_seconds) is None
+                    for b in range(prev_index + 1, cur_index)))
+
+
+def _is_stray_reading_after_gap(prev: tuple[int, float, float], cur: tuple[int, float, float],
+                                frames: list[Event], sample_interval: float,
+                                full_game_seconds: float = FULL_GAME_SECONDS) -> bool:
+    """Whether `cur`, a game's LAST clock reading, is a stray read rather than the game
+    resuming: it comes after a clock-less intermission, it is not a rise (those are
+    _looks_like_new_game's), and its frame shows no fighter. A lower reading after a long
+    break was always taken for the same game un-pausing, which let one misread of
+    on-screen text stretch a game across the whole break (a "coming up next" card read
+    as 2:53, fourteen minutes after the game's real last reading of 4:34, on a Melee
+    stream whose calibrated clock box is read without the detector confirming a clock is
+    there). A game that really resumes shows fighters, or goes on to give further
+    readings, in which case `cur` is not its last and this is never asked of it.
+
+    The clock-less gap itself must show no fighter PAIR either: a stretch of gameplay where
+    the clock merely failed to read (occluded, misparsed) is not an intermission, and a
+    last reading after it on a frame where the fighter detector happened to miss would
+    otherwise be dropped, cutting the game short at the reading before the gap. A pair,
+    not one side: the detector fires on one side alone on a system menu or a results card
+    (a lone "Hero" on a Switch home screen stretched a game 120 s onto it when one side
+    was enough), where gameplay shows both.
+
+    Only meaningful for a run that loaded a character detector: the caller skips it
+    otherwise (fighter_check, as in _timer_reset_indices), since without one no frame ever
+    carries a fighter."""
+    prev_index, prev_seconds, _ = prev
+    cur_index, cur_seconds, _ = cur
+    return (cur_seconds - prev_seconds <= TIMER_DROP_TOLERANCE_SEC
+            and _clockless_gap_between(prev, cur, frames, sample_interval, full_game_seconds)
+            and not any(_has_fighter_pair(frames[b]) for b in range(prev_index + 1, cur_index))
+            and not _has_characters(frames[cur_index]))
+
+
+def _has_fighter_pair(frame: Event) -> bool:
+    """True if the character detector found a fighter on BOTH HUD sides: gameplay, as
+    against a menu or a results card where it fires on one side alone."""
+    chars = frame.get("characters")
+    return bool(chars and chars.get("left") and chars.get("right"))
 
 
 def _has_characters(frame: Event) -> bool:
@@ -308,7 +387,8 @@ def _synthesized_event(timestamp_sec: float, reference_frame: Marker) -> Marker:
     }
 
 
-def _clean_timer_frames(frames: list[Event], stem: str = "") -> list[Event]:
+def _clean_timer_frames(frames: list[Event], stem: str = "",
+                        full_game_seconds: float = FULL_GAME_SECONDS) -> list[Event]:
     """Remove timer readings that fell faster than real time allows: the clock can't count
     down more seconds than have actually passed, so these are OCR mistakes. Returns a new
     list; frames with a bad reading get a copy with the timer removed, the rest are reused
@@ -320,13 +400,15 @@ def _clean_timer_frames(frames: list[Event], stem: str = "") -> list[Event]:
     too-fast and would cascade-strip the whole game. When a flagged reading instead resumes the
     countdown from the reading *before* the anchor, the anchor was the misread, so we re-anchor onto
     the real run rather than stripping it (the lone blip is left in place; it's harmless to splitting)."""
-    bad_indices, bad_pairs = _flag_implausible(frames, _timer_readings(frames))
+    bad_indices, bad_pairs = _flag_implausible(frames, _timer_readings(frames, full_game_seconds))
     if bad_pairs:
         _dump_implausible(bad_pairs, stem)
     return _strip_timers(frames, bad_indices)
 
 
-def _timer_reset_indices(frames: list[Event], sample_interval: float = DEFAULT_SAMPLE_INTERVAL_SEC) -> list[int]:
+def _timer_reset_indices(frames: list[Event], sample_interval: float = DEFAULT_SAMPLE_INTERVAL_SEC,
+                         full_game_seconds: float = FULL_GAME_SECONDS, *,
+                         fighter_check: bool = True) -> list[int]:
     """Return the positions of frames where a new game starts. Two signals open a new game:
 
     1. The clock jumps back up by more than RESET_JUMP_SEC between adjacent readings. Checking
@@ -353,12 +435,21 @@ def _timer_reset_indices(frames: list[Event], sample_interval: float = DEFAULT_S
     different game (a single-sample game like a hand-warmer the validation could never confirm). It
     must instead land on real gameplay: the new reading's frame has a detected fighter. That rejects a
     rise onto a menu/versus screen where the timer OCR misread on-screen text (e.g. a character-select name -> 4:30).
+    That fighter evidence only exists for a run that loaded a character detector (Ultimate's
+    portrait detector, or Melee's stock-icon detector, which fills `characters` only when it
+    sees exactly two stock slots, so singles only): pass ``fighter_check=False`` for a run
+    without one (Rivals 2, Other, a run whose declared weight was missing), whose frames never carry
+    a fighter, or no intermission cut could ever fire for it and two games separated by a
+    clock-less break would merge whenever the new game's first read arrived too late for the
+    jump test (seen on a Rivals 2 Auto run, 2026-09-05). Such a run keeps the other guards (the
+    clock-less gap, the rise, the back-calculation below); the residual risk is a misread of
+    on-screen text that happens to parse as a plausible clock right after a break.
     With no successor to bound it, an intermission cut is also rejected when the new game's
     back-calculated start (clock implies it began that long ago) would precede the prior reading: an
     impossible overlap from a small rise over a short gap; the new game's elapsed time must fit the gap.
     "go"/"game" frames are skipped because their full-screen graphic can sometimes obscure the
     clock. Pass in frames already run through _clean_timer_frames."""
-    readings = _timer_readings(frames)
+    readings = _timer_readings(frames, full_game_seconds)
     cuts: list[int] = []
     prev: tuple[int, float, float] | None = None   # last trusted reading: (index, seconds, timestamp)
     for position, (index, seconds, timestamp) in enumerate(readings):
@@ -367,7 +458,7 @@ def _timer_reset_indices(frames: list[Event], sample_interval: float = DEFAULT_S
             # The two new-game signals (see _looks_like_new_game): a clear clock jump, or a
             # smaller rise across a multi-sample clock-less intermission.
             jumped_up, intermission = _looks_like_new_game(
-                prev, (index, seconds, timestamp), frames, sample_interval)
+                prev, (index, seconds, timestamp), frames, sample_interval, full_game_seconds)
             if jumped_up or intermission:
                 cut = False
                 # Strict path: the next reading must continue the new clock: dropped a plausible
@@ -387,8 +478,9 @@ def _timer_reset_indices(frames: list[Event], sample_interval: float = DEFAULT_S
                 # seen: with no successor to bound it, a small rise over the minimum gap extrapolates
                 # the new game's start (timestamp - elapsed) backwards into the prior game, producing
                 # two overlapping games. A new game's elapsed time has to fit within the clock-less gap.
-                back_calc_start = timestamp - (FULL_GAME_SECONDS - seconds)
-                if (not cut and intermission and _has_characters(frames[index])
+                back_calc_start = timestamp - (full_game_seconds - seconds)
+                on_gameplay = _has_characters(frames[index]) if fighter_check else True
+                if (not cut and intermission and on_gameplay
                         and back_calc_start >= prev_timestamp - TIMER_DROP_TOLERANCE_SEC):
                     cut = True
                 if cut:
@@ -399,75 +491,117 @@ def _timer_reset_indices(frames: list[Event], sample_interval: float = DEFAULT_S
     return cuts
 
 
-def _back_calculated_start(seg_frames: list[Event]) -> Marker:
+def _back_calculated_start(seg_frames: list[Event],
+                           full_game_seconds: float = FULL_GAME_SECONDS) -> Marker:
     """Work out when a game actually started, for a segment created by a timer reset. The
-    first frame in the segment is usually mid-game, so use its clock: if 6:00 is left, the
-    game began (7:00 - 6:00) = 1 minute earlier. This assumes the game was not paused before
+    first frame in the segment is usually mid-game, so use its clock: on Ultimate's 7:00 clock,
+    if 6:00 is left, the game began (7:00 - 6:00) = 1 minute earlier; `full_game_seconds` swaps
+    in a different clock length for other games. This assumes the game was not paused before
     that first reading; pause-aware refinement lives in pause_check.py as an opt-in postprocess."""
     first_frame = seg_frames[0]
     for frame in seg_frames:
-        remaining = timer_sec(frame)
+        remaining = timer_sec(frame, full_game_seconds)
         if remaining is not None:
-            # First clock reading in the segment: the game began (7:00 - remaining) earlier.
-            start = frame["timestamp_sec"] - (FULL_GAME_SECONDS - remaining)
+            # First clock reading in the segment: the game began (full_game_seconds - remaining) earlier.
+            start = frame["timestamp_sec"] - (full_game_seconds - remaining)
             return _synthesized_event(start, first_frame)
     # No clock reading anywhere in the segment: fall back to the first frame's time.
     return _synthesized_event(first_frame["timestamp_sec"], first_frame)
 
 
-def _first_game_start(frames: list[Event]) -> Marker:
+def _first_game_start(frames: list[Event],
+                      full_game_seconds: float = FULL_GAME_SECONDS) -> Marker:
     """The first seek-mode game's start. Like every later game, back-calculate it from the clock so a
     clock-less intro before the first reading (stream cards, player intros, the bracket) isn't glued
     onto match 1: but never earlier than the first sampled frame. A clock that implies the game began
     before the footage (e.g. the stream joined mid-game) is clamped to the footage start rather than
     extrapolated into unsampled pre-game; that also leaves a VOD whose first frame already shows a clock
     starting exactly where it does today."""
-    back_calc = _back_calculated_start(frames)
+    back_calc = _back_calculated_start(frames, full_game_seconds)
     return back_calc if back_calc["timestamp_sec"] >= frames[0]["timestamp_sec"] else frames[0]
 
 
-def _last_timer_frame(seg: list[Event]) -> Event:
+def _last_timer_frame(seg: list[Event],
+                      full_game_seconds: float = FULL_GAME_SECONDS) -> Event:
     """Return the last frame in the segment that still shows a clock. "go"/"game" frames are
     skipped because their graphic can produce unreliable timer readings. Falls back to the
     final frame if none has a reading."""
     for frame in reversed(seg):
-        if frame.get("label") not in ("go", "game") and timer_sec(frame) is not None:
+        if frame.get("label") not in ("go", "game") and timer_sec(frame, full_game_seconds) is not None:
             return frame
     return seg[-1]
 
 
-def _end_anchor_frame(seg: list[Event], sample_interval: float) -> Event:
+def _end_anchor_frame(seg: list[Event], sample_interval: float,
+                      full_game_seconds: float = FULL_GAME_SECONDS, *,
+                      fighter_check: bool = True) -> Event:
     """Like _last_timer_frame, but it won't anchor a game's end on a *trailing* reading that looks
-    like the start of the NEXT game. When a split fails to fire (e.g. a single foreign clock sampled
+    like the start of the NEXT game, nor on a stray reading long after the game stopped showing
+    a clock (_is_stray_reading_after_gap; only with `fighter_check`, i.e. for a run that loaded
+    a character detector). When a split fails to fire (e.g. a single foreign clock sampled
     after a long intermission/character-select), that orphan reading would otherwise extend the clip
     far past where this game actually ended. So walk back over the clock readings and drop any whose
     rise over its predecessor is the splitter's own new-game signal: a jump over RESET_JUMP_SEC, or
     a smaller rise across a multi-sample clock-less intermission: anchoring instead on the end of the
-    game's own contiguous clock run. A real last reading only *falls* relative to its predecessor, so
-    it is never dropped. With GAP_AWARE_END_ANCHOR off this is exactly _last_timer_frame.
+    game's own contiguous clock run. A real last reading only *falls* relative to its predecessor,
+    with no clock-less intermission before it (or with fighters on its frame), so it is never dropped. With GAP_AWARE_END_ANCHOR off this is exactly _last_timer_frame.
     (Applies _timer_reset_indices' own jumped_up/intermission test via _looks_like_new_game,
     so the two can't drift apart.)
     """
+    return _end_anchor(seg, sample_interval, full_game_seconds, fighter_check=fighter_check)[0]
+
+
+def _end_anchor(seg: list[Event], sample_interval: float,
+                full_game_seconds: float = FULL_GAME_SECONDS, *,
+                fighter_check: bool = True) -> tuple[Event, bool]:
+    """_end_anchor_frame's walk, also saying whether it backed over a stray reading
+    (_is_stray_reading_after_gap). A game whose end was anchored before a stray has an
+    intermission after it inside its own frames, which must not vote on its tags
+    (_build_games); an end backed over a next-game reading changes nothing about the vote,
+    which already stops at the last clock reading as it always has."""
     if not GAP_AWARE_END_ANCHOR:
-        return _last_timer_frame(seg)
-    readings = _timer_readings(seg)
+        return _last_timer_frame(seg, full_game_seconds), False
+    readings = _timer_readings(seg, full_game_seconds)
     if not readings:
-        return seg[-1]
+        return seg[-1], False
+    # The stray rule reads fighter evidence, so it applies only where the run's frames
+    # carry any: a run whose detector never fills a fighter pair (Melee doubles, read
+    # singles-only) would otherwise call every reading after a clock dropout a stray and
+    # walk the end back to the game's first minute.
+    stray_rule = fighter_check and any(_has_fighter_pair(frame) for frame in seg)
     k = len(readings) - 1
+    skipped_stray = False
     while k > 0:
         jumped_up, intermission = _looks_like_new_game(readings[k - 1], readings[k],
-                                                       seg, sample_interval)
-        if not (jumped_up or intermission):
+                                                       seg, sample_interval, full_game_seconds)
+        stray = stray_rule and _is_stray_reading_after_gap(
+            readings[k - 1], readings[k], seg, sample_interval, full_game_seconds)
+        if not (jumped_up or intermission or stray):
             break
-        k -= 1   # cur is a next-game clock the splitter wouldn't trust: back up to its predecessor
-    return seg[readings[k][0]]
+        # cur is a next-game clock the splitter wouldn't trust, or a stray read after the
+        # game was over: back up to its predecessor. (A stray is a fall within
+        # TIMER_DROP_TOLERANCE_SEC after a gap; a jump or an intermission needs a rise, so
+        # the three never coincide.)
+        if stray:
+            skipped_stray = True
+        k -= 1
+    return seg[readings[k][0]], skipped_stray
 
 
-def _synthesized_end(seg: list[Event], next_start_ts: float, sample_interval: float) -> Marker:
+def _synthesized_end(seg: list[Event], next_start_ts: float, sample_interval: float,
+                     full_game_seconds: float = FULL_GAME_SECONDS, *,
+                     fighter_check: bool = True) -> Marker:
     """Pick an end time for a game that isn't the last one: one sample interval after its
     final clock reading, but no later than END_LEAD_SEC before the next game starts
     (whichever comes first), and never before its own final clock reading."""
-    last_frame = _end_anchor_frame(seg, sample_interval)
+    last_frame = _end_anchor_frame(seg, sample_interval, full_game_seconds,
+                                   fighter_check=fighter_check)
+    return _synthesized_end_from(last_frame, next_start_ts, sample_interval)
+
+
+def _synthesized_end_from(last_frame: Event, next_start_ts: float,
+                          sample_interval: float) -> Marker:
+    """_synthesized_end for an end anchor already found (see it for the rule)."""
     interval_end = last_frame["timestamp_sec"] + sample_interval
     lead_end = next_start_ts - END_LEAD_SEC
     # Floor at the last clock reading: a rapid rematch can put next_start within END_LEAD_SEC
@@ -476,22 +610,30 @@ def _synthesized_end(seg: list[Event], next_start_ts: float, sample_interval: fl
     return _synthesized_event(end_ts, last_frame)
 
 
-def _match_voting_frames(frames: list[Event], start_ts: float) -> list[Event]:
+def _match_voting_frames(frames: list[Event], start_ts: float,
+                         full_game_seconds: float = FULL_GAME_SECONDS, *,
+                         end_ts: float | None = None) -> list[Event]:
     """The frames that should sway a game's tag vote: from its (clock-derived) start through its last
-    clock reading. Dropping frames *before* the start keeps a pre-game intro / VS card out of the vote
-    (the in-game scoreboard overlay carries the same player/round tags during play); dropping the
-    trailing clock-less frames keeps post-game char-select / results out. If nothing is left or the
+    clock reading, and never past `end_ts`, the end the game was given. Dropping frames *before* the
+    start keeps a pre-game intro / VS card out of the vote (the in-game scoreboard overlay carries
+    the same player/round tags during play); dropping the trailing clock-less frames keeps post-game
+    char-select / results out; dropping the frames past the end keeps an intermission's cards out
+    when the end was anchored before a stray reading (_end_anchor_frame). If nothing is left or the
     game shows no clock at all, keep what there is rather than emptying the vote."""
-    kept = [f for f in frames if f["timestamp_sec"] >= start_ts]
+    kept = [f for f in frames
+            if f["timestamp_sec"] >= start_ts and (end_ts is None or f["timestamp_sec"] <= end_ts)]
     if not kept:
         return frames
-    last = max((i for i, f in enumerate(kept) if timer_sec(f) is not None), default=len(kept) - 1)
+    last = max((i for i, f in enumerate(kept) if timer_sec(f, full_game_seconds) is not None),
+              default=len(kept) - 1)
     return kept[: last + 1]
 
 
 def _build_games(frames: list[Event], cuts: list[int], first_start: Marker,
                  last_end: Marker | None, sample_interval: float, trim_voting: bool,
-                 debug: bool = False, stem: str = "", stage: str = "") -> list[Match]:
+                 debug: bool = False, stem: str = "", stage: str = "",
+                 full_game_seconds: float = FULL_GAME_SECONDS, *,
+                 fighter_check: bool = True) -> list[Match]:
     """Cut `frames` at `cuts` into one match per game and fill in each game's start and end.
 
     Shared by extract_matches_timer_only and split_on_timer_reset; expects `frames` already
@@ -506,6 +648,10 @@ def _build_games(frames: list[Event], cuts: list[int], first_start: Marker,
       debug        print the per-frame, per-segment, and per-game DataFrames before returning.
       stem, stage  passed to dump_dataframes: stem picks the per-vod debug folder, stage names
                    the {name}_{stage}.csv debug CSVs.
+      full_game_seconds  the full match clock (Ultimate's 7:00 by default), used to bound valid
+                   readings and back-calculate starts.
+      fighter_check  whether the run loaded a character detector, as in _timer_reset_indices:
+                   lets a game's end skip a stray clock reading (_end_anchor_frame).
     Every game after the first starts from its clock, and ends at the earlier of: last clock
     reading + sample interval, or END_LEAD_SEC before the next game starts."""
     # Turn the cut points into [0, cut1, cut2, ..., len] and slice one frame run per game.
@@ -515,25 +661,31 @@ def _build_games(frames: list[Event], cuts: list[int], first_start: Marker,
 
     # The first game keeps the given start (real `go`, or the first sampled frame); every
     # later game has no detected boundary, so back-calculate its start from the clock.
-    starts = [first_start] + [_back_calculated_start(seg) for seg in segments[1:]]
+    starts = [first_start] + [_back_calculated_start(seg, full_game_seconds) for seg in segments[1:]]
 
     games: list[Match] = []
     for idx, (seg, start) in enumerate(zip(segments, starts)):
+        anchor, skipped_stray = _end_anchor(seg, sample_interval, full_game_seconds,
+                                            fighter_check=fighter_check)
         if idx < len(segments) - 1:
             # Internal game: end just before the next game's start (see _synthesized_end).
-            end = _synthesized_end(seg, starts[idx + 1]["timestamp_sec"], sample_interval)
+            end = _synthesized_end_from(anchor, starts[idx + 1]["timestamp_sec"], sample_interval)
         elif last_end is not None:
             # Last game, caller supplied a real end (the `game` detection): use it as-is.
             end = last_end
         else:
             # Last game with no detected end: extend one sample interval past the final clock.
-            last_tf = _end_anchor_frame(seg, sample_interval)
-            end = _synthesized_event(last_tf["timestamp_sec"] + sample_interval, last_tf)
+            end = _synthesized_event(anchor["timestamp_sec"] + sample_interval, anchor)
 
         if trim_voting:
             # Restrict voting frames to this game's own span (drop a pre-game intro before the
             # start and trailing char-select/results) so neither sways the player-tag vote.
-            seg = _match_voting_frames(seg, start["timestamp_sec"])
+            # When the end was anchored before a stray reading, the intermission between the
+            # two is inside this segment too: its cards stop at the end as well. (Only then:
+            # frames up to a refused next-game reading have always voted, and taking them
+            # away moved the tags of a dozen stored runs, some for the worse.)
+            seg = _match_voting_frames(seg, start["timestamp_sec"], full_game_seconds,
+                                       end_ts=end["timestamp_sec"] if skipped_stray else None)
 
         games.append({
             "duration_sec": round(end["timestamp_sec"] - start["timestamp_sec"], 3),
@@ -554,16 +706,22 @@ def _build_games(frames: list[Event], cuts: list[int], first_start: Marker,
 
 
 def split_on_timer_reset(match: Match, sample_interval: float = DEFAULT_SAMPLE_INTERVAL_SEC,
-                         debug: bool = False, stem: str = "", stage: str = "") -> list[Match]:
+                         debug: bool = False, stem: str = "", stage: str = "", *,
+                         full_game_seconds: float = FULL_GAME_SECONDS,
+                         fighter_check: bool = True) -> list[Match]:
     """Split one match that actually contains several games into a separate match per game,
     cutting wherever the clock resets. The first game keeps the real `go` start and the last
     keeps the real `game` end; the starts in between are worked out from the clock, and each
     of those games ends at the earlier of last clock reading + sample interval or END_LEAD_SEC
     before the next game. Returns [match] unchanged if the clock never resets.
+    `full_game_seconds` is the full match clock (Ultimate's 7:00 by default; pass a game's own
+    clock length for anything else), used to bound valid clock readings and back-calculate
+    game starts; `fighter_check` as in extract_matches_timer_only.
     Pass debug=True to print the frame/segment/game DataFrames from _build_games; stem/stage
     name its debug CSVs."""
-    frames = _clean_timer_frames(match["frames"], stem=stem)
-    cuts = _timer_reset_indices(frames, sample_interval)
+    frames = _clean_timer_frames(match["frames"], stem=stem, full_game_seconds=full_game_seconds)
+    cuts = _timer_reset_indices(frames, sample_interval, full_game_seconds=full_game_seconds,
+                                fighter_check=fighter_check)
     if not cuts:
         return [match]
 
@@ -571,4 +729,5 @@ def split_on_timer_reset(match: Match, sample_interval: float = DEFAULT_SAMPLE_I
           f"→ split into {len(cuts) + 1} games")
 
     return _build_games(frames, cuts, match["start"], match["end"],
-                        sample_interval, trim_voting=False, debug=debug, stem=stem, stage=stage)
+                        sample_interval, trim_voting=False, debug=debug, stem=stem, stage=stage,
+                        full_game_seconds=full_game_seconds, fighter_check=fighter_check)

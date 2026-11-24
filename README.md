@@ -8,7 +8,7 @@
 
 Ultimate VOD Studio splits tournament VODs and groups them into sets using the stream overlay or ingame tags (for recording setups). It includes an intuitive review screen that lets you quickly fix any errors the broadcaster or the program made. It also includes an upload assistant to easily upload the VODs to YouTube.
 
-Currently supports: SSBU
+Currently supports: Ultimate, Melee and Rivals 2
 
 > **Unofficial fan project.** Not affiliated with or endorsed by any copyright holder of the above games. See [`NOTICE`](NOTICE).
 
@@ -35,14 +35,16 @@ You'll likely have to approve the "unidentified developer" warnings on the first
 
 ## Getting Started
 
-> This program NEVER modifies your original VOD file (it only copies it), so feel free to experiment with this app's options without worrying.
+> This program NEVER modifies your original VOD file (it just copies it), so feel free to experiment with this app's options without worrying.
 
-1. Pick a VOD to analyze. Default settings are usually fine.
+1. Pick your game and the VOD to analyze. Default settings are usually fine.
     - If your tournament has "fancy" fonts, set the font style to "Stylized"
+    - If you are analyzing an unsupported game or if the preview/analysis keeps missing your stream's player tags, see [custom overlay layouts](USAGE.md#custom-overlay-layouts)
 2. If you have an NVIDIA GPU or are on a M1 or later Mac, it should take a couple minutes (or less) to analyze depending on the size of your VOD. If you don't have those, it will still work, but it will take like 10-20 minutes (or more) depending on your machine.
 3. Once analysis finishes, you'll be brought to the review screen. Here you can make edits to correct any errors either the program or the streamer made. More often than not, the edits will be minor.
 4. Once you're done with your edits, click "Review and export" 
 
+<img src="assets/screenshots/1_analyze.png" alt="The Analyze page: the game, the video and the preview" width="700">
 
 **[For a more in depth guide (with pictures) click here!](USAGE.md)**
 
@@ -59,7 +61,8 @@ You can change these in settings.
 ## Future Plans
 
 - VOD Thumbnail generator
-- Support for other games (e.g. Rivals 2 or other fighting games)
+- Typing exact values for the layout editor's boxes
+- Support for more fighting games (other platform fighters should already work with a custom overlay layout, see the [usage guide](USAGE.md#custom-overlay-layouts))
 
 ---
 
@@ -78,20 +81,20 @@ uv run --extra gui ultimate-vod-studio
 The model weights aren't in the repo. You have to grab them from the repo before analyzing.
 
 ```bash
-python src/vodparse/cli/download_weights.py
+uv run python -m vodparse.cli.download_weights
 ```
 
 For the stylized text option, you need to do another download.
 
 ```bash
-python -m vodparse.cli.doctr_support fetch
+uv run python -m vodparse.cli.doctr_support fetch
 ```
 
 You can optionally run analysis/extraction from the command line.
 
 ```bash
-python -m vodparse.cli.pipeline --video my_vod.mp4
-python -m vodparse.cli.extract_matches --input json_output/my_vod/pipeline.json --video my_vod.mp4
+uv run python -m vodparse.cli.pipeline --video my_vod.mp4
+uv run python -m vodparse.cli.extract_matches --input json_output/my_vod/pipeline.json --video my_vod.mp4
 ```
 
 The first command finds the matches and writes them to `json_output/`. The second one cuts the video into individual sets. You'll get a bunch of .mp4 files and a .csv with extra data in `video_out/`
@@ -111,7 +114,7 @@ Run `build_mac.sh` (macOS) or `build_windows.ps1` (Windows) from the repo root
 
 ## About the models
 
-The character and timer detection models were trained on my own captured footage from my console (as well as synthetic data). No tournament streams were used to train these models. These models were trained on my own laptop (not in the cloud or whatnot). 
+The SSBU character and timer detection models were trained on my own captured footage from my console (as well as synthetic data). The SSBM and Rivals 2 clock detectors were trained on frames from tournament streams with the TO's permission. The SSBM character detector was trained on synthetic data. These models were trained on my own laptop (not in the cloud or whatnot). 
 
 ---
 

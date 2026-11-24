@@ -8,10 +8,13 @@ import csv
 from pathlib import Path
 
 from .match_extraction import timer_sec
+from .overlay_layout import (REGION_INGAME_P1, REGION_INGAME_P2, REGION_PLAYER1, REGION_PLAYER2,
+                             CustomOverlayLayout)
 from .schema import Event, Match
 from .text_utils import format_timestamp
+from .games import INGAME_BAND_NONE, INGAME_BAND_TAGS
 from .tags import (INGAME_TAG_BAND_FRAC_DEFAULT, find_best_of, find_player_names, find_round,
-                   find_tournament_tags)
+                   find_tournament_tags, nameplates_from_boxes)
 
 
 def _segment_bounds(frames: list[Event], cuts: list[int]) -> list[int]:
@@ -176,14 +179,60 @@ _FRAMES_CSV_FIELDS = [
     "frame_ingame_tag_left", "frame_ingame_tag_right",
     "frame_round", "frame_best_of",
     "frame_character_left", "frame_character_right",
+    "frame_stocks_left", "frame_stocks_right",
     "all_texts",
 ]
+
+
+def _frame_tournament_tags(frame: Event, frame_width: int, frame_height: int) -> tuple[str, str]:
+    """One frame's (left, right) tournament-tag reads for the frames CSV, routed as the
+    match-level vote was: from the frame's player-box reads when the run read the overlay
+    from both players' boxes (a drawn layout's gamertag boxes, or the rows the side-bar
+    pre-pass locked: event["layout_reads"], see tags.attach_overlay_regions), else from the
+    position heuristics over the frame's texts (tags.find_tournament_tags). A flagless heuristic read
+    can still emit a fixed-slot pair with a None side (the lone-tag salvage): the slot
+    positions are kept, so a salvaged right-only read lands in the right column."""
+    reads = frame.get("layout_reads") or {}
+    # BOTH player boxes, as the vote requires (OverlayRegions.reads_player_boxes): a layout
+    # with one gamertag box drawn votes the tags from the heuristics, so the columns do too.
+    if REGION_PLAYER1 in reads and REGION_PLAYER2 in reads:
+        return (reads[REGION_PLAYER1]["text"], reads[REGION_PLAYER2]["text"])
+    pair = find_tournament_tags(frame.get("texts", []), frame_width=frame_width,
+                                frame_height=frame_height) or [None, None]
+    return (pair[0]["text"] if pair[0] else "", pair[1]["text"] if pair[1] else "")
+
+
+def _frame_nameplates(frame: Event, layout: CustomOverlayLayout | None, ingame_band: str,
+                      frame_width: int, frame_height: int,
+                      ingame_tag_frac: float) -> tuple[str, str]:
+    """The (left, right) in-game nameplate columns for one frame, routed exactly as the
+    match-level vote routes them (tags.enrich_match): from the layout's drawn nameplate boxes
+    when the run votes those (tags.nameplates_from_boxes; the band is then never searched, and
+    on such a run the pipeline never even OCR'd it, see overlay_bands.band_ocr_plan); nothing
+    when the band is read as nothing (INGAME_BAND_NONE leaves it unread, drawn boxes or not);
+    else by re-running the band search over the frame's texts (find_player_names)."""
+    if nameplates_from_boxes(layout, ingame_band):
+        assert layout is not None   # nameplates_from_boxes implies a layout
+        reads = frame.get("layout_reads") or {}
+        # Per side of the layout's own boxes, mirroring attach_layout_ingame's loop: an
+        # undrawn side is simply not read (the pipeline never writes a read for it).
+        left = reads.get(REGION_INGAME_P1) if layout.ingame_p1 is not None else None
+        right = reads.get(REGION_INGAME_P2) if layout.ingame_p2 is not None else None
+        return (left["text"] if left else "", right["text"] if right else "")
+    if ingame_band == INGAME_BAND_NONE:
+        return ("", "")
+    found = find_player_names(frame.get("texts", []), frame_width=frame_width,
+                              frame_height=frame_height, ingame_tag_frac=ingame_tag_frac) or []
+    return (found[0]["text"] if found else "",
+            found[1]["text"] if len(found) > 1 else "")
 
 
 def write_frames_csv(matches: list[Match], path: str,
                      set_lookup: dict[int, int] | None = None,
                      frame_width: int = 1920, frame_height: int = 1080,
-                     ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT) -> None:
+                     ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT,
+                     layout: CustomOverlayLayout | None = None,
+                     ingame_band: str = INGAME_BAND_TAGS) -> None:
     """Write one row per frame per match for pandas inspection.
     Per-frame columns: raw detections and timer readings.
     Match-level columns: voted tags/round/best-of and end timestamp.
@@ -192,7 +241,11 @@ def write_frames_csv(matches: list[Match], path: str,
     tags.INGAME_TAG_BAND_FRAC_DEFAULT): the per-frame ingame-tag columns re-run
     find_player_names, so gating them at the default 0.92 while a widened run voted the
     match-level columns at a lower band would make the two disagree for exactly the shrunk
-    captures the band exists to serve."""
+    captures the band exists to serve. `layout` (the custom overlay layout the run read
+    with) and `ingame_band` (what the game's nameplate band holds this run, one of
+    games.INGAME_BAND_MODES, as resolved for the vote) are threaded for the same reason:
+    the per-frame nameplate columns are routed exactly as the vote was, from the layout's
+    drawn boxes, from the band search, or from nothing (see _frame_nameplates)."""
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_FRAMES_CSV_FIELDS)
         writer.writeheader()
@@ -207,13 +260,15 @@ def write_frames_csv(matches: list[Match], path: str,
                 chars   = frame.get("characters")
                 char_l  = chars.get("left") if chars else None
                 char_r  = chars.get("right") if chars else None
-                # A flagless read can still emit a fixed-slot pair with a None side (the
-                # lone-tag salvage): keep the slot positions intact so a salvaged right-only
-                # read still lands in the right column below, not the left.
-                t_tags  = find_tournament_tags(texts, frame_width=frame_width,
-                                               frame_height=frame_height) or [None, None]
-                i_tags  = find_player_names(texts, frame_width=frame_width, frame_height=frame_height,
-                                            ingame_tag_frac=ingame_tag_frac)
+                # Stocks left per player, from a stock-icon read (stock_icons.detect_stock_icons):
+                # only when exactly two HUD slots were seen, the same rule that fills the
+                # character read; blank on portrait-detector runs, which record no slots.
+                slots   = frame.get("stock_slots") or []
+                stocks_l, stocks_r = ((slots[0]["stocks"], slots[1]["stocks"])
+                                      if len(slots) == 2 else ("", ""))
+                t_tag_l, t_tag_r = _frame_tournament_tags(frame, frame_width, frame_height)
+                i_tag_l, i_tag_r = _frame_nameplates(frame, layout, ingame_band,
+                                                     frame_width, frame_height, ingame_tag_frac)
                 rnd     = find_round(texts, frame_height)
                 best_of = find_best_of(texts, frame_height)
                 ts      = frame.get("timestamp_sec", 0)
@@ -238,14 +293,16 @@ def write_frames_csv(matches: list[Match], path: str,
                     "timer_formatted":            timer["formatted"] if timer else "",
                     "timer_seconds":              timer["total_seconds"] if timer else "",
                     "timer_confidence":           timer.get("confidence", "") if timer else "",
-                    "frame_tournament_tag_left":  t_tags[0]["text"] if t_tags[0] else "",
-                    "frame_tournament_tag_right": t_tags[1]["text"] if t_tags[1] else "",
-                    "frame_ingame_tag_left":      i_tags[0]["text"] if i_tags else "",
-                    "frame_ingame_tag_right":     i_tags[1]["text"] if i_tags and len(i_tags) > 1 else "",
+                    "frame_tournament_tag_left":  t_tag_l,
+                    "frame_tournament_tag_right": t_tag_r,
+                    "frame_ingame_tag_left":      i_tag_l,
+                    "frame_ingame_tag_right":     i_tag_r,
                     "frame_round":                rnd["text"] if rnd else "",
                     "frame_best_of":              best_of["text"] if best_of else "",
                     "frame_character_left":       char_l["name"] if char_l else "",
                     "frame_character_right":      char_r["name"] if char_r else "",
+                    "frame_stocks_left":          stocks_l,
+                    "frame_stocks_right":         stocks_r,
                     "all_texts":                  "|".join(
                                                       f"{t['text']}({t.get('confidence', 0):.2f})"
                                                       for t in texts

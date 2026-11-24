@@ -75,9 +75,9 @@ class UpdateChecker(QObject):
             # and point at the git route (mirrors gpu_support's from-source refusal).
             QMessageBox.information(
                 self._parent_widget, "Check for updates (running from source)",
-                "You're running from a source checkout, so there's nothing to update in place. "
+                "You're running from a source checkout, so there's nothing to update here. "
                 "Pull the latest code with `git pull` instead.\n\n"
-                "The in-app update check applies to the packaged app.")
+                "This update check is for the packaged app.")
             return
         if self._thread is not None:
             if self._dialog is not None:
@@ -182,7 +182,7 @@ class UpdateChecker(QObject):
         else:  # CHECK_FAILED
             QMessageBox.information(
                 self._parent_widget, "Couldn't check for updates",
-                f"{result.error}\n\nPlease try again later, or check the releases page:\n"
+                f"{result.error}\n\nPlease try again later or check the releases page:\n"
                 f"{_RELEASES_PAGE}")
 
     def _show_update_available(self, result: UpdateCheckResult) -> None:

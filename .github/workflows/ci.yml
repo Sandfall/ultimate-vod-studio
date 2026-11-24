@@ -39,8 +39,11 @@ jobs:
           # CPU-only torch so CI doesn't download the multi-GB CUDA build. Installed first so the
           # editable install below sees torch already satisfied and won't pull the default wheel.
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[gui,test]"
-          pip install ruff==0.15.20 mypy==2.1.0
+          # PyQt6 pinned to the versions the builds ship (build_windows.ps1, build_mac.sh):
+          # a newer PyQt6's type stubs can fail mypy on unchanged code, as 6.12.1's did.
+          pip install -e ".[gui,test]" "PyQt6==6.11.0" "PyQt6-Qt6==6.11.2" "PyQt6-sip==13.11.1"
+          # The versions the dev environment runs; keep in step with it.
+          pip install ruff==0.17.2 mypy==2.4.0
 
       - name: Ruff (lint)
         run: ruff check .

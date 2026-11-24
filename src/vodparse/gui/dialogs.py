@@ -1,4 +1,4 @@
-"""Dialogs for the desktop GUI (app.py): Advanced Extract Options, the log popup, and Settings.
+"""Dialogs for the desktop GUI (app.py): Advanced Analysis Options, the log popup, and Settings.
 
 Import these only after ``qt_plugins.configure_qt_plugins()`` has run (every app entry
 module does so at its top), since this module imports PyQt6 widgets at load time.
@@ -48,12 +48,17 @@ from vodparse.gui.settings import (
     FONT_SCALE_CHOICES,
     FONT_SCALE_DEFAULT,
     OCR_LANG_CHOICES,
+    EXPORT_MODE_DEFAULT,
     OCR_LANG_DEFAULT_GUI,
     SET_CHARACTERS_DEFAULT,
     SETTING_CONFIRM_GROUP,
+    ASK_CONVERT_MKV_DEFAULT,
+    SETTING_ASK_CONVERT_MKV,
     SETTING_DEFAULT_VOD_DIR,
     SETTING_EXPORT_DIR,
     SETTING_FONT_SCALE,
+    GATE_OCR_ON_TIMER_DEFAULT,
+    OCR_ROI_CACHE_DEFAULT,
     SETTING_GATE_OCR_ON_TIMER,
     SETTING_GPU_SKIP_FIRST_RUN_OFFER,
     SETTING_INGAME_TAG_BAND_FRAC,
@@ -62,49 +67,45 @@ from vodparse.gui.settings import (
     SETTING_SHOW_DEBUG_MENU,
     SETTING_SHOW_ETA,
     SETTING_SHOW_FONT_STYLE_NOTE,
+    SETTING_SHOW_LAYOUT_PREVIEW,
+    SHOW_LAYOUT_PREVIEW_DEFAULT,
     SETTING_TITLE_CHAR_LIMIT,
     SETTING_TITLE_FILENAMES_MATCHES,
     SETTING_TITLE_FILENAMES_SETS,
     SETTING_UPLOAD_DESC_TEMPLATE,
     SETTING_UPLOAD_TITLE_TEMPLATE,
     TITLE_CHAR_LIMIT_DEFAULT,
+    band_frac_from_pct,
+    band_pct_from_frac,
 )
 from vodparse.gui.review.flags import (
     LONG_LEADIN_INTERVALS_DEFAULT,
-    MAX_MATCH_SEC_DEFAULT,
+    LONG_MATCH_HEADROOM_SEC_DEFAULT,
     MIN_MATCH_SEC_DEFAULT,
     SETTING_FLAG_LONG_LEADIN,
     SETTING_FLAG_LONG_MATCHES,
     SETTING_FLAG_SHORT_MATCHES,
     SETTING_FLAG_WEIRD_TIMER,
     SETTING_LONG_LEADIN_INTERVALS,
-    SETTING_MAX_MATCH_SEC,
+    SETTING_LONG_MATCH_HEADROOM_SEC,
     SETTING_MIN_MATCH_SEC,
 )
 from vodparse.gui.review.model import (
+    MATCH_SEEK_OFFSET_SEC_DEFAULT,
+    MATCH_SEEK_OFFSET_SEC_MAX,
     SETTING_MARK_INGAME_FALLBACK,
+    SETTING_MATCH_SEEK_OFFSET_SEC,
 )
+from vodparse.ffmpeg_runtime import mkv_plays_directly
 from vodparse.runtime_paths import workspace_dir
 from vodparse.tags import INGAME_TAG_BAND_FRAC_DEFAULT, INGAME_TAG_BAND_FRAC_FLOOR
-
-
-def _band_pct_from_frac(frac: float) -> int:
-    """The in-game nametag band's height as a whole-number percent of frame height, for the
-    Settings spinbox: the stored top-edge fraction 0.92 (bottom 8%) shows as 8, 0.86 as 14."""
-    return round((1.0 - frac) * 100)
-
-
-def _band_frac_from_pct(pct: int) -> float:
-    """Inverse of _band_pct_from_frac: the spinbox's height-percent back to the stored top-edge
-    fraction the pipeline/CLI take (8 % -> 0.92). Rounded to 2 dp to match --ingame-tag-band-frac."""
-    return round(1.0 - pct / 100, 2)
 
 
 class TagReadingOptions(QWidget):
     """The Smart/Manual tag-reading control: the two-radio choice plus the four manual
     overlay-reading toggles, with the toggles greyed out under Smart.
 
-    Shared verbatim by the Advanced Extract Options dialog and the Review screen's reread
+    Shared verbatim by the Advanced Analysis Options dialog and the Review screen's reread
     tags dialog, so the carefully-worded checkbox labels and tooltips live in exactly one
     place and can't drift between the two. ``options`` seeds the initial state and
     ``values()`` reads it back: both keyed by the five settings.TAG_OPTION_KEYS
@@ -203,27 +204,58 @@ class TagReadingOptions(QWidget):
         }
 
 
+# The muted note under the Advanced Analysis Options popup's "Export as" radios while Games
+# is selected: what that choice changes, since it decides what Review and Export produce.
+# Hidden under Sets, the default. See ExtractOptionsDialog._refresh_mode_note.
+EXPORT_MODE_GAMES_NOTE = "Each game will be exported as its own clip"
+
+
 class ExtractOptionsDialog(QDialog):
     """Advanced options for the extract step, edited in a popup.
 
     Most options here change the matches JSON that extract writes (tag voting and match
     boundaries). The clip-export-only flags (start/end buffers, tournament name, output
     folder) do nothing in the GUI's ``--csv-only`` extract and are applied later at
-    Review/Export, so they're intentionally absent. The exception is "Set characters"
-    (--set-characters), a set-grouping choice that's also applied at Review/Export but lives
-    here next to the other extract knobs; it's a string ("join"/"majority"), not a bool.
+    Review/Export, so they're intentionally absent. The exceptions are "Export as" (--mode:
+    whole sets or individual games) and "Set characters" (--set-characters), choices that are
+    also applied at Review/Export but live here next to the other extract knobs; both are
+    strings ("tournament_set"/"match" and "join"/"majority"), not bools.
     ``options`` (a flat dict keyed by the extract_matches flag name) is mutated in place when
     the dialog is accepted.
     """
 
     def __init__(self, options: dict, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Advanced Extract Options")
+        self.setWindowTitle("Advanced Analysis Options")
         self._options = options
 
         # The Smart/Manual tag-reading control (radios + four toggles + greying) is shared
         # with the Review screen's reread tags dialog, so it lives in one widget.
         self._tag_options = TagReadingOptions(options, self)
+
+        # Whether Review/Export works on whole sets or on each game as its own clip. Maps
+        # each radio to the extract_matches --mode value.
+        self._mode_radios = {
+            "tournament_set": QRadioButton("Sets"),
+            "match": QRadioButton("Games"),
+        }
+        self._mode_choice = QButtonGroup(self)
+        mode_row = QHBoxLayout()
+        for radio in self._mode_radios.values():
+            self._mode_choice.addButton(radio)
+            mode_row.addWidget(radio)
+        mode_row.addStretch(1)
+        self._mode_radios.get(
+            options.get("export_mode", EXPORT_MODE_DEFAULT),
+            self._mode_radios[EXPORT_MODE_DEFAULT]).setChecked(True)
+        # Muted note under the radios spelling out the Games choice (EXPORT_MODE_GAMES_NOTE):
+        # an aside beside its own control, so it stays quieter than the main page's teal
+        # notes. It follows the radios live, so a restored Games choice shows it on open.
+        self._mode_note = QLabel(EXPORT_MODE_GAMES_NOTE)
+        self._mode_note.setStyleSheet(f"color: {muted_text_color()};")  # grey, theme-aware
+        self._mode_note.setWordWrap(True)
+        self._mode_radios["match"].toggled.connect(self._refresh_mode_note)
+        self._refresh_mode_note()
 
         # How a set's per-player character field reads when they switched characters between
         # games. Maps each radio to the extract_matches --set-characters value. Only affects
@@ -238,6 +270,9 @@ class ExtractOptionsDialog(QDialog):
         self._setchars_radios.get(
             options.get("set_characters", SET_CHARACTERS_DEFAULT),
             self._setchars_radios["join"]).setChecked(True)
+        # The character choice only shapes set exports, so it greys out under Games.
+        self._mode_radios["tournament_set"].toggled.connect(self._update_setchars_enabled)
+        self._update_setchars_enabled()
 
         self._debug = QCheckBox("Save debug tables")
         self._debug.setChecked(options["debug"])
@@ -248,6 +283,9 @@ class ExtractOptionsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
+        layout.addWidget(self._section("Export as"))
+        layout.addLayout(mode_row)
+        layout.addWidget(self._mode_note)
         layout.addWidget(self._section("Tag reading"))
         layout.addWidget(self._tag_options)
         layout.addWidget(self._section("Character Detection"))
@@ -268,8 +306,19 @@ class ExtractOptionsDialog(QDialog):
             **self._tag_options.values(),
             debug=self._debug.isChecked(),
             set_characters=self._selected_setchars(),
+            export_mode=selected_radio_value(self._mode_radios, EXPORT_MODE_DEFAULT),
         )
         super().accept()
+
+    def _refresh_mode_note(self) -> None:
+        """Show the Games note only while Games is the selected export mode."""
+        self._mode_note.setVisible(self._mode_radios["match"].isChecked())
+
+    def _update_setchars_enabled(self) -> None:
+        """Enable the Set characters radios only while exporting sets."""
+        enabled = self._mode_radios["tournament_set"].isChecked()
+        for radio in self._setchars_radios.values():
+            radio.setEnabled(enabled)
 
     def _selected_setchars(self) -> str:
         """The --set-characters value for the checked radio (defaults to 'join')."""
@@ -394,14 +443,14 @@ class AboutDialog(QDialog):
 class RereadTagsDialog(QDialog):
     """Reread the tournament tags for the video being reviewed under different flags.
 
-    A Review-only editor. It seeds the same Smart/Manual control as the Advanced Extract
+    A Review-only editor. It seeds the same Smart/Manual control as the Advanced Analysis
     Options popup (see TagReadingOptions) from the flags that actually produced the current
     matches.json, and on OK those flags drive a one-off regeneration of THIS video's matches
-    only. The choices are **never persisted**: unlike the Advanced Extract Options popup,
+    only. The choices are **never persisted**: unlike the Advanced Analysis Options popup,
     they don't touch the global ``extract/opt_*`` settings used for the next VOD. ``options``
     (the five TAG_OPTION_KEYS) is mutated in place on accept, matching ExtractOptionsDialog's
-    in-place contract; the set-grouping/character/mode knobs stay on the Main page
-    and are deliberately not editable here.
+    in-place contract; the set-grouping knob (Main page) and the character and mode knobs
+    (Advanced Analysis Options) are deliberately not editable here.
     """
 
     def __init__(self, options: dict, vod_name: str, parent=None) -> None:
@@ -499,6 +548,40 @@ def _duration_seconds(edit: QTimeEdit) -> int:
     return t.minute() * 60 + t.second()
 
 
+# ── Row helpers shared by the Settings dialogs ───────────────────────────────────────────
+# Module-level so ReviewFlagsGroup (below) and the two Settings dialogs (SettingsDialog here,
+# the vod grabber's) build their rows the same way.
+ROW_INDENT_PX = 24   # a qualifier row or hint sits this far under the control it belongs to
+
+
+def indented_row(label_text: str, widget: QWidget) -> QHBoxLayout:
+    """An indented "<label> <widget>" row, indented under the checkbox it qualifies."""
+    row = QHBoxLayout()
+    row.addSpacing(ROW_INDENT_PX)
+    row.addWidget(QLabel(label_text))
+    row.addWidget(widget)
+    row.addStretch(1)
+    return row
+
+
+def hint_row(text: str) -> QHBoxLayout:
+    """An indented, word-wrapped hint line in the muted text color: the shared style for
+    the small explanatory notes under a control (same indent as indented_row)."""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setStyleSheet(f"color: {muted_text_color()};")
+    row = QHBoxLayout()
+    row.addSpacing(ROW_INDENT_PX)
+    row.addWidget(label, 1)
+    return row
+
+
+def bind_enabled(checkbox: QCheckBox, widget: QWidget) -> None:
+    """Grey out `widget` unless `checkbox` is ticked (the qualifier only matters when on)."""
+    widget.setEnabled(checkbox.isChecked())
+    checkbox.toggled.connect(widget.setEnabled)
+
+
 # Fixed opening size for the Settings dialog. sizeHint() is unreliable once the tabs hold
 # word-wrapped hint labels, and sizing to the content would let the tallest tab inflate every
 # tab. The dialog stays resizable, and each tab scrolls (see _scrollable), so a tab whose
@@ -516,6 +599,167 @@ _SHOW_FONT_SCALE_SETTING = False
 # group frames looking joined together, so each page sets this once via _page rather than pushing
 # the groups apart with per-gap addSpacing() calls, which is how the tabs drifted apart before.
 _TAB_GROUP_SPACING = 18
+
+# ── Review flags: one box shared with the vod grabber ─────────────────────────────────────
+# The wording of the Review tab's "Review flags" group, then the box itself
+# (ReviewFlagsGroup), which both Settings dialogs embed, so the main GUI and the vod grabber
+# cannot drift in text, order or wiring.
+REVIEW_FLAGS_GROUP_TITLE = "Review flags"
+REVIEW_FLAG_LONG_LABEL = "Flag unusually long games for review"
+REVIEW_FLAG_LONG_ROW = "Flag games longer than the game clock by:"
+REVIEW_FLAG_LONG_HINT = (
+    "Replays, handwarmers, etc. can sometimes cause the analyzer to "
+    "miss the start/end of a game, resulting in two games merged into one clip.")
+REVIEW_FLAG_SHORT_LABEL = "Flag very short games for review"
+REVIEW_FLAG_SHORT_ROW = "Flag games shorter than:"
+REVIEW_FLAG_SHORT_HINT = "Short games are usually handwarmers or restarts."
+REVIEW_FLAG_WEIRD_LABEL = "Flag games with a bad start timer for review"
+REVIEW_FLAG_WEIRD_HINT = (
+    "Restarts, replays, pauses, etc. can cause clips to have a wrong start timer. "
+    "This setting flags that.")
+REVIEW_FLAG_LEADIN_LABEL = "Flag games with a long lead-in for review"
+REVIEW_FLAG_LEADIN_ROW = "Flag a long lead-in past:"
+REVIEW_FLAG_LEADIN_HINT = (
+    "A replay on the stream, the streamer forgetting to switch the scene on time, "
+    "or the analyzer missing the clock at the beginning can cause a game's clip to start "
+    "well before the game does.")
+REVIEW_MARK_INGAME_FALLBACK_LABEL = "Mark ingame fallback tags"
+REVIEW_MARK_INGAME_FALLBACK_HINT = (
+    "When in 'auto' mode, mark tags that were read from the ingame HUD instead of the overlay.")
+
+# The qualifiers' bounds: the two mm:ss fields (the over-long headroom and the too-short limit),
+# and the long-lead-in threshold in OCR scan intervals (a half step is fine-grained enough; higher
+# means fewer flags). The over-long limit is entered as headroom past the VOD's own game clock, so
+# one value suits every game.
+LONG_MATCH_HEADROOM_BOUNDS_SEC = (0, 1200)   # 0:00 .. 20:00 past the game clock
+MIN_MATCH_BOUNDS_SEC = (5, 300)        # 0:05 .. 5:00
+LEADIN_INTERVALS_BOUNDS = (1.0, 20.0)
+LEADIN_INTERVALS_STEP = 0.5
+LEADIN_INTERVALS_SUFFIX = " × scan interval"
+
+
+class ReviewFlagsGroup(QGroupBox):
+    """The "Review flags" box of a Settings dialog's Review tab: the five markers the Review
+    list puts on games, each with its hint and, where it has one, the qualifier it is judged
+    by (a mm:ss limit, a count of scan intervals) greyed out while its flag is off. Reads its
+    values from ``settings`` when built; ``save`` writes them back under the keys the Review
+    screen reads (vodparse.gui.review.flags / .model). Built once here and embedded by both
+    the main GUI's SettingsDialog (below) and the vod grabber's, which is what keeps the two
+    dialogs identical.
+
+    The controls are public so a dialog, or a test, can read and drive them."""
+
+    def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
+        super().__init__(REVIEW_FLAGS_GROUP_TITLE, parent)
+
+        self.flag_long = self._checkbox(settings, SETTING_FLAG_LONG_MATCHES, REVIEW_FLAG_LONG_LABEL)
+        self.long_match_headroom = _duration_edit(
+            settings.value(SETTING_LONG_MATCH_HEADROOM_SEC, LONG_MATCH_HEADROOM_SEC_DEFAULT,
+                           type=float),
+            *LONG_MATCH_HEADROOM_BOUNDS_SEC)
+        bind_enabled(self.flag_long, self.long_match_headroom)
+
+        self.flag_short = self._checkbox(settings, SETTING_FLAG_SHORT_MATCHES, REVIEW_FLAG_SHORT_LABEL)
+        self.min_match = _duration_edit(
+            settings.value(SETTING_MIN_MATCH_SEC, MIN_MATCH_SEC_DEFAULT, type=float),
+            *MIN_MATCH_BOUNDS_SEC)
+        bind_enabled(self.flag_short, self.min_match)
+
+        self.flag_weird = self._checkbox(settings, SETTING_FLAG_WEIRD_TIMER, REVIEW_FLAG_WEIRD_LABEL)
+
+        self.flag_long_leadin = self._checkbox(
+            settings, SETTING_FLAG_LONG_LEADIN, REVIEW_FLAG_LEADIN_LABEL)
+        self.leadin_intervals = QDoubleSpinBox()
+        self.leadin_intervals.setRange(*LEADIN_INTERVALS_BOUNDS)
+        self.leadin_intervals.setSingleStep(LEADIN_INTERVALS_STEP)
+        self.leadin_intervals.setDecimals(1)
+        self.leadin_intervals.setSuffix(LEADIN_INTERVALS_SUFFIX)
+        self.leadin_intervals.setValue(
+            settings.value(SETTING_LONG_LEADIN_INTERVALS, LONG_LEADIN_INTERVALS_DEFAULT, type=float))
+        bind_enabled(self.flag_long_leadin, self.leadin_intervals)
+
+        self.mark_ingame_fallback = self._checkbox(
+            settings, SETTING_MARK_INGAME_FALLBACK, REVIEW_MARK_INGAME_FALLBACK_LABEL)
+
+        # Top to bottom: each flag, its qualifier row (when it has one), its hint.
+        rows: list[QWidget | QLayout] = [
+            self.flag_long, indented_row(REVIEW_FLAG_LONG_ROW, self.long_match_headroom),
+            hint_row(REVIEW_FLAG_LONG_HINT),
+            self.flag_short, indented_row(REVIEW_FLAG_SHORT_ROW, self.min_match),
+            hint_row(REVIEW_FLAG_SHORT_HINT),
+            self.flag_weird, hint_row(REVIEW_FLAG_WEIRD_HINT),
+            self.flag_long_leadin, indented_row(REVIEW_FLAG_LEADIN_ROW, self.leadin_intervals),
+            hint_row(REVIEW_FLAG_LEADIN_HINT),
+            self.mark_ingame_fallback, hint_row(REVIEW_MARK_INGAME_FALLBACK_HINT),
+        ]
+        layout = QVBoxLayout(self)
+        for row in rows:
+            if isinstance(row, QWidget):
+                layout.addWidget(row)
+            else:
+                layout.addLayout(row)
+
+    @staticmethod
+    def _checkbox(settings: QSettings, setting: str, label: str) -> QCheckBox:
+        """A labelled checkbox initialised from ``setting`` (every flag is on by default)."""
+        checkbox = QCheckBox(label)
+        checkbox.setChecked(settings.value(setting, True, type=bool))
+        return checkbox
+
+    def save(self, settings: QSettings) -> None:
+        """Write every control's value to ``settings`` (the dialog's accept)."""
+        settings.setValue(SETTING_FLAG_LONG_MATCHES, self.flag_long.isChecked())
+        settings.setValue(SETTING_LONG_MATCH_HEADROOM_SEC,
+                          float(_duration_seconds(self.long_match_headroom)))
+        settings.setValue(SETTING_FLAG_SHORT_MATCHES, self.flag_short.isChecked())
+        settings.setValue(SETTING_MIN_MATCH_SEC, float(_duration_seconds(self.min_match)))
+        settings.setValue(SETTING_FLAG_WEIRD_TIMER, self.flag_weird.isChecked())
+        settings.setValue(SETTING_FLAG_LONG_LEADIN, self.flag_long_leadin.isChecked())
+        settings.setValue(SETTING_LONG_LEADIN_INTERVALS, float(self.leadin_intervals.value()))
+        settings.setValue(SETTING_MARK_INGAME_FALLBACK, self.mark_ingame_fallback.isChecked())
+
+
+# ── Playback: one box shared with the vod grabber ─────────────────────────────────────────
+# The Review tab's "Playback" group, embedded under ReviewFlagsGroup by both Settings dialogs
+# for the same reason: the grabber embeds the same ReviewScreen, which reads this setting.
+PLAYBACK_GROUP_TITLE = "Playback"
+PLAYBACK_SEEK_OFFSET_ROW = "Start a game this far in when clicked:"
+PLAYBACK_SEEK_OFFSET_HINT = (
+    "Streams often cut to the game a second or two late. Set an offset here to make it "
+    "easier to jump between games on the Review screen.")
+
+
+class PlaybackGroup(QGroupBox):
+    """The "Playback" box of a Settings dialog's Review tab: where the playhead lands when a
+    game row inside a set is clicked (SETTING_MATCH_SEEK_OFFSET_SEC, which the Review screen
+    reads live on every click). Embedded by both the main GUI's SettingsDialog and the vod
+    grabber's, like ReviewFlagsGroup.
+
+    The control is public so a dialog, or a test, can read and drive it."""
+
+    def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
+        super().__init__(PLAYBACK_GROUP_TITLE, parent)
+
+        # Whole seconds: the lag it compensates for is a production cut, not something
+        # anyone tunes to a fraction of a second.
+        self.match_seek_offset = QSpinBox()
+        self.match_seek_offset.setRange(0, int(MATCH_SEEK_OFFSET_SEC_MAX))
+        self.match_seek_offset.setSuffix(" s")
+        self.match_seek_offset.setValue(int(settings.value(
+            SETTING_MATCH_SEEK_OFFSET_SEC, MATCH_SEEK_OFFSET_SEC_DEFAULT, type=float)))
+
+        seek_offset_row = QHBoxLayout()        # a plain labelled row: no checkbox to indent under
+        seek_offset_row.addWidget(QLabel(PLAYBACK_SEEK_OFFSET_ROW))
+        seek_offset_row.addWidget(self.match_seek_offset)
+        seek_offset_row.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(seek_offset_row)
+        layout.addLayout(hint_row(PLAYBACK_SEEK_OFFSET_HINT))
+
+    def save(self, settings: QSettings) -> None:
+        """Write the control's value to ``settings`` (the dialog's accept)."""
+        settings.setValue(SETTING_MATCH_SEEK_OFFSET_SEC, float(self.match_seek_offset.value()))
 
 
 class SettingsDialog(QDialog):
@@ -618,6 +862,17 @@ class SettingsDialog(QDialog):
         open_app_data_row.addWidget(open_app_data)
         open_app_data_row.addStretch(1)
 
+        # Windows plays an MKV directly, so only there is the conversion offer a choice
+        # (see ffmpeg_runtime.mkv_plays_directly). Elsewhere the checkbox is never built:
+        # accept() saves it only when it exists.
+        self._ask_convert_mkv: QCheckBox | None = None
+        files_items: list[QWidget | QLayout] = [dir_row, open_app_data_row]
+        if mkv_plays_directly():
+            self._ask_convert_mkv = QCheckBox("Ask to convert .mkv files to .mp4")
+            self._ask_convert_mkv.setChecked(self._settings.value(
+                SETTING_ASK_CONVERT_MKV, ASK_CONVERT_MKV_DEFAULT, type=bool))
+            files_items.append(self._ask_convert_mkv)
+
         self._show_debug_menu = QCheckBox("Show the Debug menu in the menu bar")
         self._show_debug_menu.setChecked(
             self._settings.value(SETTING_SHOW_DEBUG_MENU, False, type=bool))
@@ -673,7 +928,7 @@ class SettingsDialog(QDialog):
         # panel is also reachable from the File-menu "GPU Acceleration…" action.
         gpu_panel = GpuStatusPanel()
 
-        groups = [self._group("Files", dir_row, open_app_data_row)]
+        groups = [self._group("Files", *files_items)]
         # Appearance holds only the text size, so the whole group comes and goes with it.
         if _SHOW_FONT_SCALE_SETTING:
             font_scale_row = QHBoxLayout()
@@ -682,7 +937,7 @@ class SettingsDialog(QDialog):
             font_scale_row.addStretch(1)
             groups.append(self._group(
                 "Appearance", font_scale_row,
-                self._hint_row("Restart to apply any text size changes.")))
+                hint_row("Restart to apply any text size changes.")))
         groups.append(self._group("Hardware acceleration", gpu_panel))
         # The buttons run in ascending scope: one window, the silenced prompts, everything.
         groups.append(self._group(
@@ -694,7 +949,8 @@ class SettingsDialog(QDialog):
         start = current if current and Path(current).is_dir() else str(vod_picker_start_dir())
         chosen = QFileDialog.getExistingDirectory(self, "Choose default VOD folder", start)
         if chosen:
-            self._default_vod_dir.setText(chosen)
+            # Qt's dialog spells Windows paths with "/": show them natively
+            self._default_vod_dir.setText(str(Path(chosen)))
 
     def _open_app_data_folder(self) -> None:
         """Reveal the writable workspace (analyses, drafts) in Finder/Explorer."""
@@ -758,7 +1014,12 @@ class SettingsDialog(QDialog):
         """Clear every stored preference so each falls back to its default, then close without
         running accept() (which would re-persist this dialog's current control values). The
         upload assistant's title/description templates survive the wipe: they're the user's
-        own writing, with their own reset button in that window."""
+        own writing, with their own reset button in that window. Custom-overlay-layout PRESETS
+        survive too, but for a different reason: they live in their own file (overlay_layouts.json,
+        see vodparse.overlay_layout), not in QSettings at all, so this clear() can't touch them
+        even without a carve-out. Only the *selection* is a QSettings key and goes back to
+        "Auto" like any other preference; it lives on the main screen's Overlay layout list,
+        which MainWindow._open_settings re-reads after this dialog closes."""
         if QMessageBox.question(
             self, "Reset all preferences?",
             "Reset every preference on every tab to its default? This can't be undone.",
@@ -786,18 +1047,18 @@ class SettingsDialog(QDialog):
         row.addWidget(QLabel("Title character limit:"))
         row.addWidget(self._title_limit)
         row.addStretch(1)
-        title_limit_hint = self._hint_row(
+        title_limit_hint = hint_row(
             "Longer titles get trimmed on export. 255 is the filename limit for Mac/Windows.")
 
         self._title_filenames_sets = QCheckBox("Name set clips after their titles")
         self._title_filenames_sets.setChecked(
             self._settings.value(SETTING_TITLE_FILENAMES_SETS, True, type=bool))
-        title_filenames_sets_hint = self._hint_row(
+        title_filenames_sets_hint = hint_row(
             "If unchecked, each set's filename will be named set1, set2, etc.")
         self._title_filenames_matches = QCheckBox("Name game clips after their titles")
         self._title_filenames_matches.setChecked(
             self._settings.value(SETTING_TITLE_FILENAMES_MATCHES, False, type=bool))
-        title_filenames_matches_hint = self._hint_row(
+        title_filenames_matches_hint = hint_row(
             "If unchecked, each game's filename will be named game1, game2, etc. This "
             "is only relevant when you're exporting single games.")
 
@@ -812,7 +1073,7 @@ class SettingsDialog(QDialog):
         export_dir_row.addWidget(QLabel("Export folder:"))
         export_dir_row.addWidget(self._export_dir_edit, 1)
         export_dir_row.addWidget(export_dir_browse)
-        export_dir_hint = self._hint_row(
+        export_dir_hint = hint_row(
             "Where exported clips are saved. Each export creates its own subfolder here.")
 
         # No timestamp-delivery choice: the Review screen's button always copies to the
@@ -830,25 +1091,35 @@ class SettingsDialog(QDialog):
         start = current if current and Path(current).is_dir() else str(default_export_root())
         chosen = QFileDialog.getExistingDirectory(self, "Choose export folder", start)
         if chosen:
-            self._export_dir_edit.setText(chosen)
+            # Qt's dialog spells Windows paths with "/": show them natively
+            self._export_dir_edit.setText(str(Path(chosen)))
 
     def _analysis_tab(self) -> QWidget:
+        # The Preview box's two looks: the layout preview (default), or the first release's
+        # still of the video's first frame for anyone who finds the live preview too much.
+        # The main window switches the box when the dialog closes (app.py
+        # _apply_layout_preview_setting).
+        self._show_layout_preview = QCheckBox("Show the layout preview")
+        self._show_layout_preview.setChecked(self._settings.value(
+            SETTING_SHOW_LAYOUT_PREVIEW, SHOW_LAYOUT_PREVIEW_DEFAULT, type=bool))
+
+        # Shown on the Preview box's progress line during a run, so it shares the group.
         self._show_eta = QCheckBox("Show estimated time remaining when analyzing a VOD")
         self._show_eta.setChecked(
             self._settings.value(SETTING_SHOW_ETA, True, type=bool))
-       
+
         self._gate_ocr_on_timer = QCheckBox("Skip analysis on frames with no timer (faster)")
         self._gate_ocr_on_timer.setChecked(
-            self._settings.value(SETTING_GATE_OCR_ON_TIMER, True, type=bool))
-        gate_ocr_hint = self._hint_row(
+            self._settings.value(SETTING_GATE_OCR_ON_TIMER, GATE_OCR_ON_TIMER_DEFAULT, type=bool))
+        gate_ocr_hint = hint_row(
             "Only read onscreen text on frames where the game clock is "
             "visible. This skips menus, commentator clips, etc. Turn this off if "
             "it seems like you're missing tags.")
 
         self._ocr_roi_cache = QCheckBox("Analyzer remembers where text lives (faster)")
         self._ocr_roi_cache.setChecked(
-            self._settings.value(SETTING_OCR_ROI_CACHE, True, type=bool))
-        roi_cache_hint = self._hint_row(
+            self._settings.value(SETTING_OCR_ROI_CACHE, OCR_ROI_CACHE_DEFAULT, type=bool))
+        roi_cache_hint = hint_row(
             "This speeds up analysis by having the OCR models not have to \"find\" the "
             "text every time they run. Try turning this off if you're getting weird tag reads.")
 
@@ -856,15 +1127,15 @@ class SettingsDialog(QDialog):
         # further up: more intuitive than the stored top-edge fraction, where lower = taller.
         # Stored as the fraction (SETTING_INGAME_TAG_BAND_FRAC) to match the pipeline's
         # --ingame-tag-band-frac and its JSON; default 0.92 = 8% (the bottom band), widening to
-        # the floor 0.86 = 14%. See _band_pct_from_frac / _band_frac_from_pct for the mapping.
+        # the floor 0.86 = 14%. See band_pct_from_frac / band_frac_from_pct for the mapping.
         self._ingame_band_pct = QSpinBox()
-        self._ingame_band_pct.setRange(_band_pct_from_frac(INGAME_TAG_BAND_FRAC_DEFAULT),
-                                       _band_pct_from_frac(INGAME_TAG_BAND_FRAC_FLOOR))
+        self._ingame_band_pct.setRange(band_pct_from_frac(INGAME_TAG_BAND_FRAC_DEFAULT),
+                                       band_pct_from_frac(INGAME_TAG_BAND_FRAC_FLOOR))
         self._ingame_band_pct.setSuffix(" %")
         saved_frac = self._settings.value(
             SETTING_INGAME_TAG_BAND_FRAC, INGAME_TAG_BAND_FRAC_DEFAULT, type=float)
-        self._ingame_band_pct.setValue(_band_pct_from_frac(saved_frac))
-        ingame_band_default_pct = _band_pct_from_frac(INGAME_TAG_BAND_FRAC_DEFAULT)
+        self._ingame_band_pct.setValue(band_pct_from_frac(saved_frac))
+        ingame_band_default_pct = band_pct_from_frac(INGAME_TAG_BAND_FRAC_DEFAULT)
         ingame_band_revert = QPushButton("Revert to default")
         ingame_band_revert.clicked.connect(
             lambda: self._ingame_band_pct.setValue(ingame_band_default_pct))
@@ -873,7 +1144,7 @@ class SettingsDialog(QDialog):
         ingame_band_row.addWidget(self._ingame_band_pct)
         ingame_band_row.addWidget(ingame_band_revert)
         ingame_band_row.addStretch(1)
-        ingame_band_hint = self._hint_row(
+        ingame_band_hint = hint_row(
             "How far up from the bottom of the screen to look for ingame tags. Higher percents "
             "are slightly slower. Bump this up to 12 or 14% if you have a VOD that isn't fit to "
             "your screen (this can happen if you used the \"Adjust Screen Size\" setting on your "
@@ -894,7 +1165,7 @@ class SettingsDialog(QDialog):
         ocr_lang_row.addWidget(QLabel("Overlay language:"))
         ocr_lang_row.addWidget(self._ocr_lang)
         ocr_lang_row.addStretch(1)
-        ocr_lang_hint = self._hint_row(
+        ocr_lang_hint = hint_row(
             "English should work for most alphanumeric tags. Use the Japanese option "
             "only for Japanese vods (it doesn't work well on English ones). The "
             "Japanese option downloads a ~60 MB model on first use.")
@@ -906,22 +1177,12 @@ class SettingsDialog(QDialog):
             self._settings.value(SETTING_SHOW_FONT_STYLE_NOTE, True, type=bool))
 
         return self._page(
-            self._group("Progress", self._show_eta),
+            self._group("Preview", self._show_layout_preview, self._show_eta),
             self._group(
                 "Text reading (OCR)", self._gate_ocr_on_timer, gate_ocr_hint,
                 self._ocr_roi_cache, roi_cache_hint, ingame_band_row, ingame_band_hint,
                 self._show_font_style_note),
-            self._group("Overlay settings", ocr_lang_row, ocr_lang_hint))
-
-    @staticmethod
-    def _indented_row(label_text: str, widget: QWidget) -> QHBoxLayout:
-        """An indented "<label> <widget>" row, indented under the checkbox it qualifies."""
-        row = QHBoxLayout()
-        row.addSpacing(24)                                # indent under the checkbox it qualifies
-        row.addWidget(QLabel(label_text))
-        row.addWidget(widget)
-        row.addStretch(1)
-        return row
+            self._group("Overlay language", ocr_lang_row, ocr_lang_hint))
 
     @staticmethod
     def _group(title: str, *items: QWidget | QLayout) -> QGroupBox:
@@ -937,90 +1198,10 @@ class SettingsDialog(QDialog):
                 layout.addLayout(item)
         return box
 
-    @staticmethod
-    def _hint_row(text: str) -> QHBoxLayout:
-        """An indented, word-wrapped hint line in the muted text color: the shared style for
-        the small explanatory notes under a control (mirrors _indented_row's 24px indent)."""
-        label = QLabel(text)
-        label.setWordWrap(True)
-        label.setStyleSheet(f"color: {muted_text_color()};")
-        row = QHBoxLayout()
-        row.addSpacing(24)                                # indent under the control it qualifies
-        row.addWidget(label, 1)
-        return row
-
-    @staticmethod
-    def _bind_enabled(checkbox: QCheckBox, widget: QWidget) -> None:
-        """Grey out `widget` unless `checkbox` is ticked (the qualifier only matters when on)."""
-        widget.setEnabled(checkbox.isChecked())
-        checkbox.toggled.connect(widget.setEnabled)
-
-    def _checkbox(self, setting: str, default: bool, label: str, tip: str = "") -> QCheckBox:
-        """A settings-backed checkbox: labelled, initialized from `setting`, with an optional
-        tooltip (most explanations are visible _hint_row lines instead)."""
-        cb = QCheckBox(label)
-        cb.setChecked(self._settings.value(setting, default, type=bool))
-        if tip:
-            cb.setToolTip(tip)
-        return cb
-
-    def _flag_row(self, checkbox: QCheckBox, row_label: str, widget: QWidget) -> QHBoxLayout:
-        """The qualifier row under a review-flag checkbox: grey `widget` out unless the flag is
-        on, laid out indented beneath it."""
-        self._bind_enabled(checkbox, widget)
-        return self._indented_row(row_label, widget)
-
     def _review_tab(self) -> QWidget:
-        self._flag_long = self._checkbox(
-            SETTING_FLAG_LONG_MATCHES, True, "Flag unusually long games for review")
-        self._max_match = _duration_edit(                 # mm:ss; 1:00 .. 30:00
-            self._settings.value(SETTING_MAX_MATCH_SEC, MAX_MATCH_SEC_DEFAULT, type=float), 60, 1800)
-        max_row = self._flag_row(self._flag_long, "Flag games longer than:", self._max_match)
-        flag_long_hint = self._hint_row(
-            "Games that run long usually happen when there's a replay on the stream, handwarmer or " 
-            "the analyzer somehow misses the end of the game.")
-
-        self._flag_short = self._checkbox(
-            SETTING_FLAG_SHORT_MATCHES, True, "Flag very short games for review")
-        self._min_match = _duration_edit(                 # mm:ss; 0:05 .. 5:00
-            self._settings.value(SETTING_MIN_MATCH_SEC, MIN_MATCH_SEC_DEFAULT, type=float), 5, 300)
-        min_row = self._flag_row(self._flag_short, "Flag games shorter than:", self._min_match)
-        flag_short_hint = self._hint_row("Short games are usually handwarmers or restarts.")
-
-        self._flag_weird = self._checkbox(
-            SETTING_FLAG_WEIRD_TIMER, True, "Flag games with a bad start timer for review")
-        flag_weird_hint = self._hint_row(
-            "The clip starts before the game clock says it began. Usually a restart, "
-            "replay, or pause.")
-
-        self._flag_long_leadin = self._checkbox(
-            SETTING_FLAG_LONG_LEADIN, True, "Flag games with a long lead-in for review")
-        self._leadin_intervals = QDoubleSpinBox()
-        self._leadin_intervals.setRange(1.0, 20.0)
-        self._leadin_intervals.setSingleStep(0.5)
-        self._leadin_intervals.setDecimals(1)
-        self._leadin_intervals.setSuffix(" × scan interval")
-        self._leadin_intervals.setValue(
-            self._settings.value(SETTING_LONG_LEADIN_INTERVALS, LONG_LEADIN_INTERVALS_DEFAULT,
-                                 type=float))
-      
-        leadin_row = self._flag_row(self._flag_long_leadin, "Flag a long lead-in past:",
-                                    self._leadin_intervals)
-        leadin_hint = self._hint_row(
-            "The game starts further back than a single analysis step could have skipped. That's "
-            "often a replay on the stream, the streamer forgetting to switch the scene on time, "
-            "or the analyzer missing the clock in the beginning.")
-
-        self._mark_ingame_fallback = self._checkbox(
-            SETTING_MARK_INGAME_FALLBACK, True, "Mark ingame fallback tags")
-        ingame_fallback_hint = self._hint_row(
-            "When in 'auto' mode, mark tags that were read from the ingame HUD instead of the overlay.")
-
-        return self._page(self._group(
-            "Review flags", self._flag_long, max_row, flag_long_hint, self._flag_short,
-            min_row, flag_short_hint, self._flag_weird, flag_weird_hint,
-            self._flag_long_leadin, leadin_row, leadin_hint,
-            self._mark_ingame_fallback, ingame_fallback_hint))
+        self._review_flags = ReviewFlagsGroup(self._settings)
+        self._playback = PlaybackGroup(self._settings)
+        return self._page(self._review_flags, self._playback)
 
     def accept(self) -> None:
         self._settings.setValue(SETTING_TITLE_CHAR_LIMIT, self._title_limit.value())
@@ -1028,24 +1209,21 @@ class SettingsDialog(QDialog):
                                 self._title_filenames_sets.isChecked())
         self._settings.setValue(SETTING_TITLE_FILENAMES_MATCHES,
                                 self._title_filenames_matches.isChecked())
-        self._settings.setValue(SETTING_FLAG_LONG_MATCHES, self._flag_long.isChecked())
-        self._settings.setValue(SETTING_MAX_MATCH_SEC, float(_duration_seconds(self._max_match)))
-        self._settings.setValue(SETTING_FLAG_SHORT_MATCHES, self._flag_short.isChecked())
-        self._settings.setValue(SETTING_MIN_MATCH_SEC, float(_duration_seconds(self._min_match)))
-        self._settings.setValue(SETTING_FLAG_WEIRD_TIMER, self._flag_weird.isChecked())
-        self._settings.setValue(SETTING_FLAG_LONG_LEADIN, self._flag_long_leadin.isChecked())
-        self._settings.setValue(SETTING_LONG_LEADIN_INTERVALS, float(self._leadin_intervals.value()))
-        self._settings.setValue(SETTING_MARK_INGAME_FALLBACK,
-                                self._mark_ingame_fallback.isChecked())
+        self._review_flags.save(self._settings)
+        self._playback.save(self._settings)
+        self._settings.setValue(SETTING_SHOW_LAYOUT_PREVIEW,
+                                self._show_layout_preview.isChecked())
         self._settings.setValue(SETTING_SHOW_ETA, self._show_eta.isChecked())
         self._settings.setValue(SETTING_GATE_OCR_ON_TIMER, self._gate_ocr_on_timer.isChecked())
         self._settings.setValue(SETTING_OCR_ROI_CACHE, self._ocr_roi_cache.isChecked())
         self._settings.setValue(SETTING_INGAME_TAG_BAND_FRAC,
-                                _band_frac_from_pct(self._ingame_band_pct.value()))
+                                band_frac_from_pct(self._ingame_band_pct.value()))
         self._settings.setValue(SETTING_OCR_LANG, self._ocr_lang.currentData())
         self._settings.setValue(SETTING_SHOW_FONT_STYLE_NOTE,
                                 self._show_font_style_note.isChecked())
         self._settings.setValue(SETTING_SHOW_DEBUG_MENU, self._show_debug_menu.isChecked())
+        if self._ask_convert_mkv is not None:
+            self._settings.setValue(SETTING_ASK_CONVERT_MKV, self._ask_convert_mkv.isChecked())
         self._settings.setValue(SETTING_FONT_SCALE, float(self._font_scale.currentData()))
         self._settings.setValue(SETTING_DEFAULT_VOD_DIR, self._default_vod_dir.text().strip())
         self._settings.setValue(SETTING_EXPORT_DIR, self._export_dir_edit.text().strip())

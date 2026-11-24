@@ -8,7 +8,7 @@ user's ``FlagSettings`` toggles. Everything is pure functions over ``vodparse.sc
 (never ReviewClip).
 
 The QSettings toggle keys/defaults and the amber/yellow row tints live here next to the logic
-they parameterize: vodparse.gui.dialogs' SettingsDialog and tools/vod_grabber.py write the keys;
+they parameterize: vodparse.gui.dialogs' SettingsDialog and the vod grabber's write the keys;
 screen.py reads them and paints the tints. Split out of model.py (the
 clip/bounds domain logic).
 """
@@ -20,12 +20,21 @@ from vodparse.gui.review.model import hms
 from vodparse.schema import Match
 
 # Flag matches longer than a full game for human review: usually a replay swept into the timeline
-# or a missed split. A real unpaused game maxes at 7:00 (420s); the default leaves headroom for a
-# paused game. The Review screen only flags these (never auto-excludes); both the toggle and the
-# threshold are user settings (keys below), shared by vodparse.gui.dialogs (the SettingsDialog) and screen.py.
+# or a missed split. A real unpaused game runs no longer than its match clock (Ultimate 7:00, Melee
+# and Rivals 2 8:00, a custom overlay layout's own), so the limit is that clock plus a headroom the
+# user sets, which leaves room for a paused game: 8:00 for Ultimate at the default headroom, 9:00
+# for Melee (see FlagSettings.max_match_sec). The Review screen only flags these (never
+# auto-excludes); both the toggle and the headroom are user settings (keys below), shared by
+# vodparse.gui.dialogs (the SettingsDialog) and screen.py.
+# The headroom replaced one absolute limit for every game (RETIRED_SETTING_MAX_MATCH_SEC, 8:00 by
+# default), which left an 8:00-clock game no room at all. That key is no longer read, and is
+# removed from the store when the Review screen is built (ReviewScreen.__init__, in the main GUI and
+# the vod grabber alike, each with its own store), so a value saved by v0.9.x doesn't linger unused.
+# It is not migrated: a customised limit starts again at the default headroom.
+RETIRED_SETTING_MAX_MATCH_SEC = "review/max_match_sec"
 SETTING_FLAG_LONG_MATCHES = "review/flag_long_matches"  # bool, default True
-SETTING_MAX_MATCH_SEC = "review/max_match_sec"  # seconds, default below
-MAX_MATCH_SEC_DEFAULT = 480.0  # 8:00
+SETTING_LONG_MATCH_HEADROOM_SEC = "review/long_match_headroom_sec"  # seconds past the clock, default below
+LONG_MATCH_HEADROOM_SEC_DEFAULT = 60.0  # 1:00
 
 # The mirror guard: flag matches *shorter* than a full game, a warm-up "hand-warmer", a false
 # positive, or a split clipped too tight. Same flag-only treatment and same shared settings story.
@@ -85,7 +94,7 @@ def long_match_reason(match: Match, threshold_sec: float) -> str | None:
     length = match["end"]["timestamp_sec"] - match["start"]["timestamp_sec"]
     if length <= threshold_sec:
         return None
-    return (f"This game runs {mmss(length)}, over the set {mmss(threshold_sec)} limit for a full game. "
+    return (f"This game runs {mmss(length)}, which might be too long for a full game. "
             f"Possibly a replay or a missed split. Check the boundaries.")
 
 
@@ -96,7 +105,7 @@ def short_match_reason(match: Match, threshold_sec: float) -> str | None:
     length = match["end"]["timestamp_sec"] - match["start"]["timestamp_sec"]
     if length >= threshold_sec:
         return None
-    return (f"This game runs only {mmss(length)}, which is under the set {mmss(threshold_sec)} minimum for a full game. "
+    return (f"This game runs only {mmss(length)}, which might be too short for a full game. "
             f"Possibly a handwarmer or a false positive. Check the boundaries.")
 
 
@@ -145,7 +154,8 @@ def _read_cadence(reads: list[tuple[float, float]]) -> float:
 
 def bad_start(match: Match, tolerance_sec: float,
               lead_in_intervals: float = LONG_LEADIN_INTERVALS_DEFAULT,
-              suggest_trim: bool = True) -> tuple[str, str] | None:
+              suggest_trim: bool = True,
+              full_game_seconds: float = FULL_GAME_SECONDS) -> tuple[str, str] | None:
     """If a match's clock readings don't back its stored start, `(kind, reason)` to flag it for review;
     otherwise None. `kind` is one of 'no_consensus', 'start_shift', 'long_leadin' so the caller can pick
     a severity/colour: 'long_leadin' is the soft case (a real-but-unobserved opening, worth a glance),
@@ -171,7 +181,9 @@ def bad_start(match: Match, tolerance_sec: float,
     reads = _clean_reads(match)
     if len(reads) < 2:
         return None
-    implied = [ts - (FULL_GAME_SECONDS - clock) for ts, clock in reads]
+    # `full_game_seconds` is the clock's length at game start: Ultimate's 7:00, a custom
+    # overlay layout's own value for other games (the extraction back-dated with the same).
+    implied = [ts - (full_game_seconds - clock) for ts, clock in reads]
     cluster = _consensus_cluster(implied, tolerance_sec)
 
     if len(cluster) < 2:
@@ -198,24 +210,36 @@ def bad_start(match: Match, tolerance_sec: float,
 
 
 def bad_start_reason(match: Match, tolerance_sec: float,
-                     lead_in_intervals: float = LONG_LEADIN_INTERVALS_DEFAULT) -> str | None:
+                     lead_in_intervals: float = LONG_LEADIN_INTERVALS_DEFAULT,
+                     full_game_seconds: float = FULL_GAME_SECONDS) -> str | None:
     """The reason string from `bad_start` (see there), or None: for callers/tests that only need the
     human-readable note, not the kind."""
-    result = bad_start(match, tolerance_sec, lead_in_intervals)
+    result = bad_start(match, tolerance_sec, lead_in_intervals,
+                       full_game_seconds=full_game_seconds)
     return result[1] if result else None
 
 
 @dataclass(frozen=True)
 class FlagSettings:
     """The Review screen's flag toggles and thresholds, read once per render from QSettings
-    (see ReviewScreen._load_flag_settings) and passed to flag_reason."""
+    (see ReviewScreen._load_flag_settings) and passed to flag_reason. `full_game_seconds` is
+    the one per-VOD value: the clock length the analysis was run with (a custom overlay
+    layout's, else the game's own, else Ultimate's 7:00). The bad-start check back-dates from
+    it, and the over-long limit is measured from it (see `max_match_sec`)."""
     flag_long_enabled: bool = True
-    max_match_sec: float = MAX_MATCH_SEC_DEFAULT
+    long_match_headroom_sec: float = LONG_MATCH_HEADROOM_SEC_DEFAULT
     flag_short_enabled: bool = True
     min_match_sec: float = MIN_MATCH_SEC_DEFAULT
     flag_weird_timer_enabled: bool = True
     flag_long_leadin_enabled: bool = True
     long_leadin_intervals: float = LONG_LEADIN_INTERVALS_DEFAULT
+    full_game_seconds: float = FULL_GAME_SECONDS
+
+    @property
+    def max_match_sec(self) -> float:
+        """The over-long limit for this VOD: its match clock plus the user's headroom
+        (7:00 + 1:00 = 8:00 for Ultimate at the defaults, 9:00 for an 8:00-clock game)."""
+        return self.full_game_seconds + self.long_match_headroom_sec
 
 
 def flag_reason(match: Match | None, is_first: bool,
@@ -241,7 +265,7 @@ def flag_reason(match: Match | None, is_first: bool,
             return reason, "flag"
     if settings.flag_weird_timer_enabled or settings.flag_long_leadin_enabled:
         bs = bad_start(match, START_CONSENSUS_TOL_DEFAULT, settings.long_leadin_intervals,
-                       suggest_trim=is_first)
+                       suggest_trim=is_first, full_game_seconds=settings.full_game_seconds)
         if bs:
             kind, reason = bs
             if kind == "long_leadin":

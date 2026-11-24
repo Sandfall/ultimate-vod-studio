@@ -4,6 +4,13 @@ Wraps QMediaPlayer + QVideoWidget over the *source* vod and lets the user scrub 
 clip's true start/end and stamp them from the playhead. Boundaries are absolute source-video
 seconds (the same space the detector and exporter use), so seeking is a direct setPosition().
 Stream-copy/keyframe seeking is ~1s-granular, which is fine for human trimming.
+
+Two other hosts reuse it as a plain scrubbing surface with a still swapped in front of the
+video (``set_display_page``): the overlay-layout editor (``vodparse.gui.overlay_editor``)
+and the Analyze page's layout preview (``vodparse.gui.layout_preview``). Both capture the
+frame whenever the playhead settles, which is what the ``scrubReleased`` and
+``playingChanged`` signals report; ``whole_vod_only=`` gives them the scrubber without
+the clip-window controls.
 """
 
 import io
@@ -13,7 +20,7 @@ from os import environ
 from os.path import basename
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QSettings, QSize, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QShowEvent
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -99,10 +106,70 @@ CLIP_VIEW_MARGIN_SEC = 120.0
 # a chosen margin carries to new vods/sessions; absent until then, leaving the constant in force.
 SETTING_CLIP_VIEW_MARGIN_SEC = "review/clip_view_margin_sec"
 
+# The play button's two labels; toggle_play swaps them (see _update_play_btn).
+PLAY_LABEL = "▶ Play"
+PAUSE_LABEL = "⏸ Pause"
+
 
 def _fmt(ms: int) -> str:
     """Milliseconds → HH:MM:SS for the transport labels (negatives clamp to 0)."""
     return hms(max(0, ms) // 1000)
+
+
+# ── The audio output and Python's lock (the GIL) ────────────────────────────────
+def _do_nothing(*_args: object) -> None:
+    """A slot with no effect, for new_audio_output's throwaway connection."""
+
+
+def new_audio_output() -> QAudioOutput:
+    """Create a player's audio output so that no Qt media thread ever needs Python's GIL
+    for it. Every QAudioOutput handed to a QMediaPlayer must come from here.
+
+    Without this the app froze for good on Windows, about once in every 30 times a player
+    was stopped or given another video:
+
+    - Qt's FFmpeg media backend (its default on Windows and Linux) plays audio on a thread
+      of its own. When playback stops, that thread destroys its renderer, which disconnects
+      from the output's signals, and Qt reports each disconnect to the output through the
+      virtual ``disconnectNotify``.
+    - An output created from Python is PyQt's subclass of QAudioOutput. Its
+      ``disconnectNotify`` first asks Python whether a Python class overrides the method,
+      and asking takes the GIL. That happens on the audio thread, while it holds one of
+      Qt's signal-slot locks.
+    - The main thread is meanwhile inside ``QMediaPlayer.stop()`` (or ``setSource``), still
+      holding the GIL, since PyQt keeps it for those calls, and it can need that same lock.
+      Each thread then waits for the other, forever.
+
+    PyQt asks only once per object. When the first ``disconnectNotify`` finds no Python
+    override, it notes that on the object, and every later call goes straight to Qt without
+    the GIL. So the first call is made here, on the thread that already holds the GIL, by
+    connecting one of the output's signals and disconnecting it again. That only works for a
+    plain QAudioOutput: a Python subclass overriding ``disconnectNotify`` is asked every time.
+
+    The macOS backend the app uses (see ``vodparse.gui.qt_plugins``) has no audio thread of
+    this kind, and the extra connection is harmless there.
+    """
+    audio = QAudioOutput()
+    connection = audio.mutedChanged.connect(_do_nothing)
+    audio.mutedChanged.disconnect(connection)
+    return audio
+
+
+# The video surface's preferred size, whatever video is loaded. QVideoWidget's own sizeHint is
+# the video's native resolution (1280x720, 1920x1080), and a preferred size that large leaks out
+# through the layouts: the Analyze page's height-for-width counts it, and Qt holds the window at
+# that height, so a 720p VOD kept the window taller than a 1080p-at-200% Windows screen (round 3
+# testing), with the Analyze/Stop row out of reach. The surface still grows into whatever room
+# its layout gives it.
+VIDEO_SURFACE_SIZE_HINT = QSize(640, 360)
+
+
+class _VideoSurface(QVideoWidget):
+    """A QVideoWidget whose preferred size doesn't follow the loaded video (see
+    VIDEO_SURFACE_SIZE_HINT)."""
+
+    def sizeHint(self) -> QSize:
+        return QSize(VIDEO_SURFACE_SIZE_HINT)
 
 
 class TrimPlayer(QWidget):
@@ -115,9 +182,18 @@ class TrimPlayer(QWidget):
     displayPageDismissed = pyqtSignal()   # the alternate display page was auto-hidden by a
     #                                       playhead move (scrub/jump/play, or a new
     #                                       source/region/seek); see set_display_page
+    # The two "playhead settled" hooks a host that captures the settled frame (the Analyze
+    # page's layout preview) listens to; neither fires for the priming kick's own play/pause.
+    scrubReleased = pyqtSignal(float)   # the scrubber was let go, at these absolute seconds
+    playingChanged = pyqtSignal(bool)   # the user started (True) or paused (False) playback
 
     def __init__(self, view_margin_sec: float = CLIP_VIEW_MARGIN_SEC,
-                 settings: QSettings | None = None) -> None:
+                 settings: QSettings | None = None, *,
+                 whole_vod_only: bool = False) -> None:
+        """``whole_vod_only`` fixes the scrubber on the whole VOD and hides the clip-window
+        controls ("Show whole VOD", "Edit preview bounds…"): for the hosts with no clip to
+        window, the layout editor and the Analyze page's layout preview, where they would
+        only be noise. The Review screen keeps the default."""
         super().__init__()
         self._source: str | None = None
         self._start_sec = 0.0
@@ -155,13 +231,18 @@ class TrimPlayer(QWidget):
         self._last_pos_trace = 0.0     # monotonic time of the last throttled position trace line
         self._last_scrub_trace = 0.0   # monotonic time of the last throttled scrub trace line
 
-        self._video = QVideoWidget()
+        self._video = _VideoSurface()
         # A small floor so the video never collapses to nothing, kept modest so it doesn't crowd
         # small screens. This is safe now that the Review window's minimum tracks its content (see
         # gui._apply_min_size): the floor just raises that minimum a little, so the window stops
         # shrinking before the video would overlap the scrubber/transport rows below it; rather
         # than pinning the video tall and letting its native surface paint over them.
         self._video.setMinimumSize(320, 120)
+        # Subtitles are never wanted here; the sink is the one place every backend's subtitle
+        # text passes through, so it is cleared there (see _drop_subtitle_text).
+        sink = self._video.videoSink()
+        if sink is not None:   # the stubs allow None; a QVideoWidget always owns a sink
+            sink.subtitleTextChanged.connect(self._drop_subtitle_text)
         self._build_player()
 
         # A host can install one alternate page for the display area (set_display_page)
@@ -180,13 +261,14 @@ class TrimPlayer(QWidget):
         # Ensure the player can paint seeks once, when the scrubber is grabbed; keeps the
         # per-move scrub (sliderMoved → _on_scrub) a plain, lag-free setPosition.
         self._slider.sliderPressed.connect(self._on_scrub_pressed)
+        self._slider.sliderReleased.connect(self._on_scrub_released)
         self._time_label = QLabel("00:00:00 / 00:00:00")
         # Fixed width + right align so the slider doesn't resize as the digits change while scrubbing.
         self._time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._time_label.setFixedWidth(
             self._time_label.fontMetrics().horizontalAdvance("00:00:00 / 00:00:00") + 10)
 
-        self._play_btn = QPushButton("▶ Play")
+        self._play_btn = QPushButton(PLAY_LABEL)
         self._play_btn.clicked.connect(self.toggle_play)
         # ⏸ included for the button's Pause state (toggle_play swaps its text). On Windows
         # these glyphs would otherwise fall back to multicolor Segoe UI Emoji; pin the flat
@@ -195,9 +277,15 @@ class TrimPlayer(QWidget):
         # the Review screen call jump_to_start/jump_to_end); the transport buttons for them
         # were dropped as clutter.
         pin_windows_symbol_font([self._play_btn], "▶⏸")
+        # Sized for the wider label from the start (after the font pin, which changes the
+        # widths), so the swap never widens the transport row: "⏸ Pause" is wider than
+        # "▶ Play", and on the layout editor that grew the whole dialog by 9 px the first
+        # time playback started (Mac, 2026-10-25).
+        self._play_btn.setMinimumWidth(max(self._play_btn_width(PLAY_LABEL),
+                                           self._play_btn_width(PAUSE_LABEL)))
         self._full_check = QCheckBox("Show whole VOD")
         self._full_check.toggled.connect(self._on_toggle_full)
-        bounds_btn = QPushButton("Edit preview bounds…")
+        bounds_btn = self._bounds_btn = QPushButton("Edit preview bounds…")
         bounds_btn.clicked.connect(self.edit_preview_bounds)
 
         transport = self._transport = QHBoxLayout()
@@ -215,6 +303,11 @@ class TrimPlayer(QWidget):
         layout.addLayout(scrub)
         layout.addLayout(transport)
 
+        if whole_vod_only:
+            self.set_full_view(True)
+            self._full_check.hide()
+            self._bounds_btn.hide()
+
     def showEvent(self, event: QShowEvent | None) -> None:
         super().showEvent(event)
         self._trace_state("showEvent")
@@ -231,13 +324,30 @@ class TrimPlayer(QWidget):
         signals to our slots. Factored out of __init__ so set_source can hand each vod a fresh
         player rather than reusing one across sources (see _rebuild_player)."""
         self._player = QMediaPlayer()
-        self._audio = QAudioOutput()
+        self._audio = new_audio_output()   # not QAudioOutput(): see new_audio_output
         self._player.setAudioOutput(self._audio)
         self._player.setVideoOutput(self._video)
         self._player.positionChanged.connect(self._on_position)
         self._player.durationChanged.connect(self._on_duration)
         self._player.mediaStatusChanged.connect(self._on_media_status)
         self._player.playbackStateChanged.connect(self._on_playback_state)
+
+    def _drop_subtitle_text(self, text: str) -> None:
+        """Clear any subtitle text the backend pushes to the video sink, so an embedded
+        subtitle track (e.g. the auto-generated captions a ``yt-dlp --embed-subs`` download
+        carries) is never drawn over the vod.
+
+        This is the only lever that works on macOS. Qt's darwin backend (``AVFMediaPlayer``)
+        means to turn subtitles off on load, but its ``setActiveTrack(SubtitleStream, -1)``
+        selects the *first* legible option whatever the index, so the track is on and
+        ``QMediaPlayer.setActiveSubtitleTrack(-1)`` cannot switch it off (the same code path
+        runs again). The backend renders subtitles by setting text on the sink, and the video
+        widget paints that text on its next repaint; clearing it here, inside the change signal,
+        leaves nothing to paint. Setting the empty string re-emits the signal once with an empty
+        text, which falls through the guard."""
+        sink = self._video.videoSink()
+        if text and sink is not None:
+            sink.setSubtitleText("")
 
     def _rebuild_player(self) -> None:
         """Replace the current player with a fresh one before loading a different vod.
@@ -272,6 +382,9 @@ class TrimPlayer(QWidget):
         self._primed = False
         self._priming = False
         self._pending_seek_ms = 0
+        # The new vod's length is unknown until durationChanged reports it (_on_duration).
+        # Kept, the old vod's length would clamp the scrubber and show in the time label.
+        self._duration_ms = 0
         self._player.setSource(QUrl.fromLocalFile(video_path))
         self._trace_state("set_source.done")
 
@@ -451,6 +564,13 @@ class TrimPlayer(QWidget):
         self.scrubbed.emit(ms / 1000.0)
         self._trace_scrub(ms)
 
+    def _on_scrub_released(self) -> None:
+        """The scrubber was let go: the playhead has settled at the last scrubbed position
+        (kept current by _on_scrub), which a frame-capturing host wants to know once per
+        drag rather than per move."""
+        self._trace_state("scrub.release")
+        self.scrubReleased.emit(self._pending_seek_ms / 1000.0)
+
     def _on_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
         self._trace_state("mediaStatus", status=status.name)
         # Cold start only: once the freshly-loaded media is ready, prime the first frame at the
@@ -462,6 +582,9 @@ class TrimPlayer(QWidget):
 
     def _on_playback_state(self, state: QMediaPlayer.PlaybackState) -> None:
         self._trace_state("playbackState", state=state.name)
+        # Read before the prime-finish branch clears it: the kick's Playing→Paused pair is
+        # the player's own doing, not the user's, and must not be reported as playing/pausing.
+        was_priming = self._priming
         if self._priming:
             if state == QMediaPlayer.PlaybackState.PlayingState:
                 self._player.pause()   # reached Playing; settle into a renderable PausedState
@@ -473,6 +596,12 @@ class TrimPlayer(QWidget):
                 self._player.setPosition(self._pending_seek_ms)
                 self._audio.setMuted(False)
         self._update_play_btn()
+        if not was_priming:
+            if state == QMediaPlayer.PlaybackState.PlayingState:
+                self.playingChanged.emit(True)
+            elif state == QMediaPlayer.PlaybackState.PausedState:
+                # StoppedState is the backend idling the player, not a user pause: silent.
+                self.playingChanged.emit(False)
 
     # ── View window ───────────────────────────────────────────────────────────
     def _apply_view(self) -> None:
@@ -673,12 +802,27 @@ class TrimPlayer(QWidget):
             ms = self._view_end_ms
         if not self._slider.isSliderDown():
             self._slider.setValue(ms)
-        self._time_label.setText(f"{_fmt(ms)} / {_fmt(self._view_end_ms)}")
+        self._show_time(ms)
         self._update_play_btn()
 
+    def _show_time(self, ms: int) -> None:
+        """The time label: the playhead at ``ms`` over the end of the scrubber's window."""
+        self._time_label.setText(f"{_fmt(ms)} / {_fmt(self._view_end_ms)}")
+
     def _update_play_btn(self) -> None:
-        self._play_btn.setText("⏸ Pause" if self._is_playing() else "▶ Play")
+        self._play_btn.setText(PAUSE_LABEL if self._is_playing() else PLAY_LABEL)
+
+    def _play_btn_width(self, label: str) -> int:
+        """The play button's natural width with ``label`` on it (its current text is put back)."""
+        shown = self._play_btn.text()
+        self._play_btn.setText(label)
+        width = self._play_btn.sizeHint().width()
+        self._play_btn.setText(shown)
+        return width
 
     def _on_duration(self, ms: int) -> None:
         self._duration_ms = ms
         self._apply_view()
+        # A paused player reports no position change, so the label would keep the end it
+        # showed before the duration arrived (another vod's, after set_source).
+        self._show_time(self._pending_seek_ms)

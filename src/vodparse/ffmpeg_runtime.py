@@ -81,7 +81,7 @@ def ensure_ffmpeg() -> str:
             "  - Ubuntu:  sudo apt install ffmpeg\n"
             "  - Windows: winget install Gyan.FFmpeg\n"
             "  - Any OS:  pip install imageio-ffmpeg   (bundled static build)\n"
-            "  - Or run the packaged Ultimate VOD Studio app, which ships ffmpeg."
+            "  - Or run the packaged Ultimate VOD Studio app, which comes with ffmpeg."
         ) from e
     return exe
 
@@ -109,28 +109,95 @@ def clip_match(video_path: str, start_sec: float, end_sec: float, output_path: s
         raise RuntimeError(f"ffmpeg failed cutting {output_path!r}:\n" + "\n".join(stderr_tail))
 
 
-# Containers Qt's QMediaPlayer (macOS AVFoundation backend) can't render, so the GUI offers a one-off
-# conversion to MP4 on selection. See MainWindow._offer_convert in vodparse.gui.app.
-UNPLAYABLE_CONTAINER_EXTS = {".mkv", ".avi"}
+# Containers Qt's QMediaPlayer can't render, so the GUI offers a one-off conversion to MP4 on
+# selection (see Mp4Converter.offer_convert in vodparse.gui.convert). macOS plays video through
+# AVFoundation, which renders none of these. Windows uses Qt's FFmpeg backend, which plays MKV
+# directly (measured 2026-10-27: an H.264 MKV plays and seeks); AVI and WebM keep the offer
+# there, since no playable file of either was tested.
+MKV_EXT = ".mkv"
+_CONVERT_FOR_PLAYBACK = frozenset({MKV_EXT, ".avi", ".webm"})
+_PLAYS_DIRECTLY_ON_WINDOWS = frozenset({MKV_EXT})
 
 
-def remux_to_mp4_argv(video_path: str, output_path: str, *, reencode: bool = False) -> list[str]:
+def unplayable_container_exts(platform: str = sys.platform) -> frozenset[str]:
+    """The containers the GUI offers to convert to MP4 before playing them, on ``platform``
+    (a ``sys.platform`` value)."""
+    if platform == "win32":
+        return _CONVERT_FOR_PLAYBACK - _PLAYS_DIRECTLY_ON_WINDOWS
+    return _CONVERT_FOR_PLAYBACK
+
+
+UNPLAYABLE_CONTAINER_EXTS = unplayable_container_exts()
+
+
+def mkv_plays_directly(platform: str = sys.platform) -> bool:
+    """True where Qt's player plays an MKV without converting it (Windows). Only there is
+    the conversion offer for an MKV a choice, so only there does the GUI show the setting
+    for it (``vodparse.gui.settings.SETTING_ASK_CONVERT_MKV``)."""
+    return MKV_EXT not in unplayable_container_exts(platform)
+
+
+def offers_conversion(path: str | Path, *, ask_for_mkv: bool,
+                      platform: str = sys.platform) -> bool:
+    """Whether choosing the video at ``path`` brings up the "convert to MP4" offer on
+    ``platform`` (a ``sys.platform`` value).
+
+    A container the player can't show always does. An MKV where the player shows it
+    directly (see mkv_plays_directly) does only when the user asked for the offer:
+    ``ask_for_mkv`` is the value of the Windows-only setting. Everywhere else an MKV is
+    among the containers the player can't show, so ``ask_for_mkv`` changes nothing."""
+    ext = Path(path).suffix.lower()
+    if ext in unplayable_container_exts(platform):
+        return True
+    return ask_for_mkv and ext == MKV_EXT
+
+# Containers whose audio is converted to AAC during the MP4 stream copy (remux_to_mp4_argv's
+# ``audio_to_aac``). A WebM's audio is always Opus or Vorbis: Vorbis can't go into an MP4 without
+# ``-strict experimental``, and AVFoundation's support for Opus-in-MP4 is doubtful. Converting
+# just the audio takes seconds to minutes and still leaves the video stream untouched.
+AAC_AUDIO_CONTAINER_EXTS = {".webm"}
+
+# What a conversion carries over, copy or re-encode: the first video stream and all audio
+# streams (the ``?`` makes a silent source fine). Subtitle and data streams are left behind on
+# purpose; see remux_to_mp4_argv.
+OUTPUT_STREAM_MAP = ["-map", "0:v:0", "-map", "0:a?"]
+
+
+def remux_to_mp4_argv(video_path: str, output_path: str, *, reencode: bool = False,
+                      audio_to_aac: bool = False) -> list[str]:
     """The ffmpeg argv that rewrites `video_path` into a QMediaPlayer-friendly MP4 at `output_path`.
 
     Includes ``-progress pipe:1`` so a QProcess caller can drive a progress bar from stdout. Stream-
-    copies by default (fast, disk-I/O bound, no quality loss). Pass ``reencode=True`` for the
-    H.264/AAC fallback: used both when the source's codecs can't live in an MP4 (e.g. VP9/Opus/PCM)
-    *and* when a copy leaves a codec the analyzer (OpenCV) can't decode (HEVC/10-bit, which macOS
-    plays natively but OpenCV's build won't); ``-pix_fmt yuv420p`` forces 8-bit 4:2:0 so both OpenCV
-    and AVFoundation read the result. ``avoid_negative_ts=make_zero`` pins the MP4 timeline to 0 so
-    seek positions stay in the source's second-space (the base the detector, exporter, and trim
-    player share). No ``+faststart``: it needs a second whole-file pass, and for a *local* file
-    AVFoundation seeks fine without it.
+    copies by default (fast, disk-I/O bound, no quality loss). ``audio_to_aac=True`` keeps the video
+    copy but converts the audio to AAC: the WebM case (see ``AAC_AUDIO_CONTAINER_EXTS``), so a
+    VP9/AV1 + Opus/Vorbis source needs no full re-encode. Pass ``reencode=True`` for the H.264/AAC
+    fallback: used both when the source's codecs can't live in an MP4 (e.g. PCM audio, subtitle
+    streams) *and* when the analyzer (OpenCV) can't decode the video codec (HEVC/10-bit, which macOS
+    plays natively but OpenCV's build won't, or AV1 on an OpenCV build without a software AV1
+    decoder); ``-pix_fmt yuv420p`` forces 8-bit 4:2:0 so both OpenCV and AVFoundation read the
+    result. ``audio_to_aac`` is ignored when re-encoding, which already outputs AAC.
+    ``avoid_negative_ts=make_zero`` pins the MP4 timeline to 0 so seek positions stay in the
+    source's second-space (the base the detector, exporter, and trim player share). No
+    ``+faststart``: it needs a second whole-file pass, and for a *local* file AVFoundation seeks
+    fine without it.
+
+    Every arm maps the first video stream and every audio stream, nothing else
+    (``OUTPUT_STREAM_MAP``). In a copy, a subtitle track (a ``yt-dlp --embed-subs`` WebM
+    carries WebVTT) or a data track cannot live in an MP4, and mapping it would fail the whole
+    copy at the header, sending the caller into the lossy re-encode for a video it could have
+    copied. In a re-encode, ffmpeg's default stream selection would instead *convert* that
+    subtitle track to an MP4 ``mov_text`` track, and the macOS player then draws it over the
+    video (see TrimPlayer._drop_subtitle_text). The pipeline never uses those streams.
     """
     common = [ensure_ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-nostats",
               "-i", video_path]
-    codec = (["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-preset", "veryfast"]
-             if reencode else ["-map", "0", "-c", "copy"])
+    if reencode:
+        codec = [*OUTPUT_STREAM_MAP, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                 "-preset", "veryfast"]
+    elif audio_to_aac:
+        codec = [*OUTPUT_STREAM_MAP, "-c", "copy", "-c:a", "aac"]   # later -c:a overrides -c for audio
+    else:
+        codec = [*OUTPUT_STREAM_MAP, "-c", "copy"]
     return [*common, *codec, "-avoid_negative_ts", "make_zero", "-progress", "pipe:1",
             "-y", output_path]
 

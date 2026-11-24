@@ -24,8 +24,9 @@ from typing import Literal, override
 from vodparse.gui.review.flags import (
     FlagSettings,
     LONG_LEADIN_INTERVALS_DEFAULT,
-    MAX_MATCH_SEC_DEFAULT,
+    LONG_MATCH_HEADROOM_SEC_DEFAULT,
     MIN_MATCH_SEC_DEFAULT,
+    RETIRED_SETTING_MAX_MATCH_SEC,
     REVIEW_FLAG_COLOR,
     REVIEW_FLAG_COLOR_DARK,
     REVIEW_LEADIN_COLOR,
@@ -35,12 +36,13 @@ from vodparse.gui.review.flags import (
     SETTING_FLAG_SHORT_MATCHES,
     SETTING_FLAG_WEIRD_TIMER,
     SETTING_LONG_LEADIN_INTERVALS,
-    SETTING_MAX_MATCH_SEC,
+    SETTING_LONG_MATCH_HEADROOM_SEC,
     SETTING_MIN_MATCH_SEC,
     flag_reason,
 )
 from vodparse.gui.review.model import (
     INGAME_FALLBACK_TOOLTIP,
+    MATCH_SEEK_OFFSET_SEC_DEFAULT,
     ReviewClip,
     REVIEW_FALLBACK_COLOR,
     REVIEW_FALLBACK_COLOR_DARK,
@@ -49,9 +51,11 @@ from vodparse.gui.review.model import (
     REVIEW_SINGLE_GAME_BG_COLOR,
     REVIEW_SINGLE_GAME_BG_COLOR_DARK,
     SETTING_MARK_INGAME_FALLBACK,
+    SETTING_MATCH_SEEK_OFFSET_SEC,
     SINGLE_GAME_SET_TOOLTIP,
     export_status_text,
     is_single_game_set,
+    match_seek_target,
     missing_tag_message,
     missing_tag_players,
     overlay_proven_for_clips,
@@ -79,7 +83,7 @@ from vodparse.gui.review.session import OpRejected, OpResult, ReviewSession, Sel
 from vodparse.gui.review.fix_caps_dialog import FixCapsOptionsDialog
 from vodparse.gui.review.sponsor_split_dialog import SponsorSplitOptionsDialog
 from vodparse.gui.common import ElidingLabel, is_dark_theme
-from vodparse.gui.paths import draft_path
+from vodparse.gui.paths import draft_path, recorded_clock_seconds
 from vodparse.schema import Match, ReviewedData
 
 from PyQt6.QtCore import QEvent, QObject, QPoint, QSettings, Qt, QTimer, pyqtSignal
@@ -218,12 +222,19 @@ class ReviewScreen(QWidget):
         # remembered across sessions (see _toggle_more). _mode starts as set mode until a model
         # loads; both feed _update_ops_visibility, which composes the two filters.
         self._settings = QSettings()
+        # The long-game flag's old absolute limit, superseded by a headroom past the clock: drop
+        # a value v0.9.x saved, unmigrated (see RETIRED_SETTING_MAX_MATCH_SEC). Done here because
+        # both the main GUI and the vod grabber build this screen at startup, each on its own store.
+        self._settings.remove(RETIRED_SETTING_MAX_MATCH_SEC)
         self._advanced_on = self._settings.value(
             SETTING_SHOW_ADVANCED_OPS, False, type=bool)
         # Over-long / too-short match flagging (settings owned by the SettingsDialog; cached per
         # render). _load_flag_settings builds self._flag_settings (a flags.FlagSettings)
         # from QSettings; refresh_flag_highlights re-reads it on a settings change; the styling
         # lives in _style_clip_row.
+        # The one per-VOD flag input: the match clock's length, read from the analysis when
+        # a VOD loads (load_model / load_from_draft); Ultimate's 7:00 until then.
+        self._full_game_seconds = FlagSettings().full_game_seconds
         self._load_flag_settings()
         self._mode = "set"
 
@@ -591,6 +602,14 @@ class ReviewScreen(QWidget):
         self._status.setText(message)
 
     # ── Review-flag settings ──────────────────────────────────────────────────
+    def _adopt_clock_length(self, video_path: str) -> None:
+        """Take the match clock's length from the VOD's saved analysis (a custom overlay
+        layout's own clock, else the game's, else 7:00) and rebuild the flag settings around
+        it, so the bad-start flag back-dates game starts the way the extraction did and the
+        over-long flag measures its headroom from this VOD's clock."""
+        self._full_game_seconds = recorded_clock_seconds(video_path)
+        self._load_flag_settings()
+
     def _load_flag_settings(self) -> None:
         """Cache the flag toggles and limits from settings (read once per render)."""
         # Bad-start-timer flags: compare each match's stored start to the consensus of its own clock
@@ -599,8 +618,8 @@ class ReviewScreen(QWidget):
         # seconds, so it holds across cadences).
         self._flag_settings = FlagSettings(
             flag_long_enabled=self._settings.value(SETTING_FLAG_LONG_MATCHES, True, type=bool),
-            max_match_sec=self._settings.value(
-                SETTING_MAX_MATCH_SEC, MAX_MATCH_SEC_DEFAULT, type=float),
+            long_match_headroom_sec=self._settings.value(
+                SETTING_LONG_MATCH_HEADROOM_SEC, LONG_MATCH_HEADROOM_SEC_DEFAULT, type=float),
             flag_short_enabled=self._settings.value(SETTING_FLAG_SHORT_MATCHES, True, type=bool),
             min_match_sec=self._settings.value(
                 SETTING_MIN_MATCH_SEC, MIN_MATCH_SEC_DEFAULT, type=float),
@@ -610,6 +629,7 @@ class ReviewScreen(QWidget):
                 SETTING_FLAG_LONG_LEADIN, True, type=bool),
             long_leadin_intervals=self._settings.value(
                 SETTING_LONG_LEADIN_INTERVALS, LONG_LEADIN_INTERVALS_DEFAULT, type=float),
+            full_game_seconds=self._full_game_seconds,
         )
         # Not a flag, but a review-screen marker gated the same way: tint sets/matches whose tags
         # fell back to the in-game nameplates (see _is_fallback_row / used_ingame_fallback).
@@ -691,6 +711,7 @@ class ReviewScreen(QWidget):
         self._session = ReviewSession.from_matches(
             matches, mode, group_by, video_path, stem,
             tournament_name=tournament_name, set_characters=set_characters)
+        self._adopt_clock_length(video_path)
         self._apply_mode_visibility(mode)
         self._player.set_source(video_path)
         self._populate_tree()
@@ -866,11 +887,17 @@ class ReviewScreen(QWidget):
         self._apply_core_regions(clip)
         self._player.set_other_regions(self._other_set_regions(self._current))
 
-        # Clicking a child match row seeks within the set to that match's start (the set window
-        # and detail panel stay put: just finer navigation than the set's start).
+        # Clicking a child match row seeks within the set to that match (the set window and
+        # detail panel stay put: just finer navigation than the set's start). The playhead lands
+        # the user's seek offset into the game, since production usually cuts to the game a
+        # beat after the detected start. Read live so a Settings change applies on the next click.
         match_start = item.data(0, _MATCH_START_ROLE)
         if match_start is not None:
-            self._player.seek_to(match_start)
+            local = item.data(0, _MATCH_LOCAL_ROLE)
+            match_end = clip["_matches"][local]["end"]["timestamp_sec"]
+            offset = self._settings.value(
+                SETTING_MATCH_SEEK_OFFSET_SEC, MATCH_SEEK_OFFSET_SEC_DEFAULT, type=float)
+            self._player.seek_to(match_seek_target(match_start, match_end, offset))
 
         self._update_op_buttons(item)
         self._update_flag_status(item)
@@ -1752,7 +1779,7 @@ class ReviewScreen(QWidget):
         try:
             write_draft_file(self._draft_path(), self._session.draft_payload())
         except OSError as e:
-            self._status.setText(f"Could not save draft: {e}")
+            self._status.setText(f"Couldn't save draft: {e}")
 
     def _read_draft(self) -> DraftPayload | None:
         return read_draft(self._draft_path())
@@ -1780,6 +1807,7 @@ class ReviewScreen(QWidget):
         if not draft:
             return False
         self._session = ReviewSession.from_draft(draft, video_path, stem, set_characters)
+        self._adopt_clock_length(video_path)
         self._apply_mode_visibility(self._session.meta["mode"])
         self._player.set_source(self._session.meta["video_path"])
         self._populate_tree()

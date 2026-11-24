@@ -43,8 +43,23 @@ rm -rf "$VENV"
 source "$VENV/bin/activate"
 python -m pip install --upgrade pip wheel
 
-echo "==> Installing the package + GUI deps"
-pip install -e ".[gui]"
+# torch first, pinned, so the editable install below sees it satisfied instead of pulling
+# the newest release. Pinned to the versions uv.lock resolves: an unpinned install drifts
+# (it resolved torch 2.14.0 / torchvision 0.29.0 in 2026-09 against a locked 2.12.0 /
+# 0.27.0), and that drift is what renamed torchvision's native libraries out from under
+# PyInstaller's hooks. When bumping, bump uv.lock with it and re-run a frozen analysis.
+# Default PyPI torch wheels on macOS already include MPS (Apple GPU) support: do NOT
+# use the CPU-only index here, that would disable MPS. The code auto-selects MPS/CPU.
+echo "==> Installing torch / torchvision (macOS wheels, pinned to uv.lock)"
+pip install "torch==2.12.0" "torchvision==0.27.0"
+
+# PyQt6 and its Qt runtime are pinned to the versions the app is developed and tested on.
+# pyproject leaves PyQt6 unpinned (right for a pip install), so an unpinned build takes
+# whatever is newest that day: in 2026-11 that was PyQt6 6.12.1 on Qt 6.12.0, a Qt that no
+# test had run on. When bumping: run the tests and a frozen analysis on the new version
+# first, and keep build_windows.ps1 and .github/workflows/ci.yml in step.
+echo "==> Installing the package + GUI deps (PyQt6 pinned)"
+pip install -e ".[gui]" "PyQt6==6.11.0" "PyQt6-Qt6==6.11.2" "PyQt6-sip==13.11.1"
 
 # Pin the one dependency whose LICENSING changes with the version. opencv-python's macOS
 # wheels vendor a Homebrew-built FFmpeg configured --enable-gpl --enable-version3, which
@@ -55,14 +70,16 @@ pip install -e ".[gui]"
 # constraint in someone else's metadata, which a doctr bump can drop without notice. Pin it
 # here instead, so NOTICE describes what ships because the build says so.
 # When bumping: read the new wheel's configure lines out of licenses/FFMPEG-BUILD-CONFIG.txt
-# after a build, and update NOTICE section 4 to match before shipping.
+# after a build, and update NOTICE section 3 to match before shipping.
 echo "==> Pinning opencv-python to the version NOTICE describes"
-pip install "opencv-python==4.13.0.92"
-
-# Default PyPI torch wheels on macOS already include MPS (Apple GPU) support: do NOT
-# use the CPU-only index here, that would disable MPS. The code auto-selects MPS/CPU.
-echo "==> Installing torch / torchvision (macOS wheels)"
-pip install torch torchvision
+# easyocr requires opencv-python-headless, which installs into the same cv2/ folder as
+# opencv-python: two wheels, possibly of different versions, overwriting each other's
+# files, and a second OpenCV in the license documents that the app never loads. Keep
+# exactly one. Removing the headless wheel deletes the cv2/ files the two share, so the
+# pinned wheel is then force-reinstalled to put them back. --no-deps: its only
+# dependency, numpy, is already installed.
+pip uninstall -y opencv-python-headless
+pip install --force-reinstall --no-deps "opencv-python==4.13.0.92"
 
 echo "==> Installing PyInstaller"
 pip install pyinstaller
@@ -168,7 +185,7 @@ if [ "$EASYOCR_WEIGHT_COUNT" -lt 2 ] || [ "$DOCTR_WEIGHT_COUNT" -lt 2 ]; then
     fi
 fi
 
-# Download weights/{timer,character,m_char}.pt from the project's GitHub Release. weights/
+# Download the model weights (vodparse.games.shipped_weight_files) from the GitHub Release. weights/
 # itself is gitignored, so a fresh checkout starts with nothing there: without this step
 # UltimateVODStudio.spec silently skips every missing weight and ships an app that can't
 # detect or read anything. Stdlib-only, so it runs fine with the build venv's python; `set -e`
@@ -184,5 +201,6 @@ pyinstaller --noconfirm --clean UltimateVODStudio.spec
 echo
 echo "==> Done. Bundle is at: \"dist/Ultimate VOD Studio.app\""
 echo "    Launch from a terminal to see logs:  \"dist/Ultimate VOD Studio.app/Contents/MacOS/Ultimate VOD Studio\""
-echo "    Outputs (json_output/, video_out/) go to: ~/Ultimate VOD Studio"
-echo "    Override that with:  ULTIMATE_VOD_WORKSPACE=/path open \"dist/Ultimate VOD Studio.app\""
+echo "    Workspace (json_output/, drafts) goes to: ~/Library/Application Support/Ultimate VOD Studio"
+echo "    Exported clips default to: ~/Movies/Ultimate VOD Studio"
+echo "    Override the workspace with:  ULTIMATE_VOD_WORKSPACE=/path open \"dist/Ultimate VOD Studio.app\""

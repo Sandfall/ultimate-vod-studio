@@ -7,14 +7,20 @@ The thread applies backpressure: it stays at most ~one frame ahead of the consum
 rather than racing on. That overlap is the point in sequential reads, but it also
 stops the reader from decoding (and discarding) every frame between two seeks, which,
 in seek mode, was ~1000 wasted decodes per seek that stole CPU from inference on
-machines without a spare core."""
+machines without a spare core.
+
+Also the single-frame path: ``VideoFrameSource`` grabs one frame at a timestamp (the
+video mode's playhead, the pre-passes' seeks), and ``sample_timestamps`` spreads a
+pre-pass's few dozen seeks over a video."""
 
 import queue
 import threading
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any, override
+from typing import Any, Self, override
 
 import cv2
+import numpy as np
 
 
 def open_capture(source: str) -> cv2.VideoCapture:
@@ -143,3 +149,124 @@ class FrameReader(threading.Thread):
 
     def __exit__(self, *exc: object) -> None:
         self.stop()
+
+
+# ── Single-frame grabbing ────────────────────────────────────────────────────────
+
+# FrameReader falls back to 30fps when CAP_PROP_FPS reads falsy (`self.fps =
+# self.cap.get(cv2.CAP_PROP_FPS) or 30`); VideoFrameSource mirrors that same fallback
+# value under its own name since it also treats a negative fps (some containers report
+# -1 for an unknown rate) as unusable, which `or` alone wouldn't catch.
+FPS_FALLBACK = 30.0
+
+
+class VideoFrameSource:
+    """cv2.VideoCapture wrapper for grabbing single frames of a video at a timestamp.
+
+    Used by the video mode to analyze the frame under the player's playhead, and by the
+    pre-passes that seek a few dozen frames across a VOD before the main pass. The grab
+    here and the player's displayed frame may differ by ~a frame (different demuxers /
+    seek rounding) accepted, because analysis, annotation, and the displayed still all
+    use the SAME grabbed frame, so what you analyze is exactly what's annotated. (The
+    GUI's async grabber finds the frame under the playhead by its real timestamp instead;
+    see gui.frame_grabber.last_frame_at_or_before.)
+
+    A context manager: ``with VideoFrameSource(path) as source:`` releases the capture on
+    the way out."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._cap = cv2.VideoCapture(path)
+        if not self._cap.isOpened():
+            self._cap.release()
+            raise ValueError(f"Couldn't open the video: {path}")
+        # (width, height) of the first frame decoded; see frame_size().
+        self._frame_size: tuple[int, int] | None = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+    def fps(self) -> float:
+        """The container's nominal frame rate, falling back to FPS_FALLBACK when it
+        doesn't report a usable one. Nominal: a variable-frame-rate file reports an
+        average, so frame arithmetic on it is approximate."""
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        return fps if fps > 0 else FPS_FALLBACK
+
+    def duration_sec(self) -> float:
+        """Video length in seconds (frame count / fps, see fps())."""
+        frame_count = self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        return frame_count / self.fps()
+
+    def grab_at(self, sec: float) -> np.ndarray | None:
+        """Seek to `sec` and decode one BGR frame (OpenCV's native layout, matching
+        load_image). Returns None when the read fails: a seek past end-of-file or a
+        decode error, both of which cv2 reports as `ok=False` rather than raising.
+        Negative timestamps clamp to the first frame.
+
+        Runs on the caller's thread: a keyframe-sparse source can take a noticeable
+        moment to seek. Moving the grab onto a worker thread is a deliberate escape
+        hatch left for later, not built here: fine for a terminal-launched dev tool."""
+        sec = max(sec, 0.0)
+        self._cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000.0)
+        ok, frame = self._cap.read()
+        if not ok or frame is None:
+            return None
+        if self._frame_size is None:
+            self._frame_size = (frame.shape[1], frame.shape[0])
+        return frame
+
+    def frames_at(self, timestamps: Iterable[float]) -> Iterator[tuple[float, np.ndarray]]:
+        """``(timestamp, frame)`` for each of ``timestamps`` in order, via ``grab_at``. A
+        timestamp the decoder cannot deliver a frame for is skipped, not yielded as None."""
+        for timestamp in timestamps:
+            frame = self.grab_at(timestamp)
+            if frame is not None:
+                yield timestamp, frame
+
+    def frame_size(self) -> tuple[int, int] | None:
+        """The video's ``(width, height)`` as decoded, never the container's metadata (which
+        some files report as 0x0). Taken from the first frame this source grabbed; when it
+        has grabbed none yet, the first frame is decoded for it. None when the video yields
+        no frame at all."""
+        if self._frame_size is None:
+            self.grab_at(0.0)
+        return self._frame_size
+
+    def release(self) -> None:
+        """Release the underlying capture. Safe to call more than once: cv2.VideoCapture
+        tolerates releasing an already-released capture."""
+        self._cap.release()
+
+
+# ── Spreading samples over a video ───────────────────────────────────────────────
+
+MIN_SAMPLE_STEP_SEC = 1.0
+"""The closest two ``sample_timestamps`` ever land: a short video yields fewer samples
+rather than several seeks onto (nearly) the same frame."""
+
+
+def sample_timestamps(duration_sec: float, count: int,
+                      span: tuple[float, float]) -> list[float]:
+    """``count`` timestamps spread evenly over the ``span`` stretch of the video, given as
+    (first, last) fractions of its duration: ``(0.05, 0.95)`` keeps 5 % clear of both
+    ends. A very short video yields fewer, never two within ``MIN_SAMPLE_STEP_SEC`` of each
+    other, and one shorter than that step yields the single mid-span timestamp. Rounded
+    to the millisecond. Empty when there is no duration or nothing is asked for.
+
+    The pre-passes that seek a few dozen frames before the main pass
+    (``clock_calibration``, ``side_overlay``) all sample through this."""
+    if duration_sec <= 0 or count <= 0:
+        return []
+    first = duration_sec * span[0]
+    last = duration_sec * span[1]
+    if count == 1 or last - first < MIN_SAMPLE_STEP_SEC:
+        return [round((first + last) / 2, 3)]
+    step = (last - first) / (count - 1)
+    if step < MIN_SAMPLE_STEP_SEC:
+        count = int((last - first) // MIN_SAMPLE_STEP_SEC) + 1
+        step = (last - first) / max(count - 1, 1)
+    return [round(first + i * step, 3) for i in range(count)]

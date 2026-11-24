@@ -48,9 +48,15 @@ jobs:
       - name: Verify bundled weights
         shell: pwsh
         run: |
-          $pts = Get-ChildItem dist/UltimateVODStudio/_internal/weights/*.pt
-          if ($pts.Count -ne 3) {
-              throw "expected 3 bundled weights (timer/character/m_char), found $($pts.Count)"
+          # One check per weight the game registry declares (vodparse.games.shipped_weight_files),
+          # by name rather than by count, so the failure says which one went missing. Keep this
+          # list in step with the registry when a game gains or loses a model.
+          $weightsDir = "dist/UltimateVODStudio/_internal/weights"
+          foreach ($name in "timer.pt", "character.pt", "m_char.pt",
+                            "timer_dx.pt", "rivals2_timer.pt", "character_dx.pt") {
+              if (-not (Test-Path "$weightsDir/$name")) {
+                  throw "bundled weight missing: $name (expected under $weightsDir)"
+              }
           }
           # The docTR text-engine models ship in the bundle too (staged by build_windows.ps1,
           # bundled by the spec under doctr_models/models/): detector + recognizer.

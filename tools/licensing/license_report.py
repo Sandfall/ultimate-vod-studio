@@ -112,6 +112,29 @@ LICENSE_OVERRIDES: dict[str, str] = {
 # --include-unshipped to see them when auditing a dev environment.
 UNSHIPPED_PREFIXES: tuple[str, ...] = ("nvidia-", "cuda-", "triton")
 
+# Distributions that install in every build environment but that UltimateVODStudio.spec
+# leaves out of the frozen app through its ``excludes=``, mapped to the import package the
+# spec names. polars is an ultralytics dependency the app never calls, and imageio-ffmpeg
+# is only the source the build scripts copy bin/ffmpeg from (that copy is recorded with
+# ``ffmpeg-config --also``). Listing them would disclose software the app does not
+# contain, and would record imageio-ffmpeg's own ffmpeg as shipping. A test checks that
+# each import package here is still in the spec's excludes, so the two cannot drift.
+EXCLUDED_FROM_BUNDLE: dict[str, str] = {
+    "polars": "polars",
+    "polars-runtime-32": "_polars_runtime_32",
+    "imageio-ffmpeg": "imageio_ffmpeg",
+}
+
+# Declared dependencies the build scripts deliberately swap for another distribution that
+# provides the same import package, keyed by normalized name. easyocr declares
+# opencv-python-headless, while doctr and ultralytics declare opencv-python. Both install
+# into cv2/, so build_mac.sh / build_windows.ps1 uninstall the headless one and keep the
+# pinned opencv-python. The closure follows the replacement instead of reporting the
+# removed name as missing, so the document lists the one OpenCV that actually ships.
+REPLACED_DISTRIBUTIONS: dict[str, str] = {
+    "opencv-python-headless": "opencv-python",
+}
+
 # Column width for the aligned "name .... license" report, matching NOTICE's style.
 _NAME_COLUMN = 34
 
@@ -211,6 +234,8 @@ def resolve_runtime_distributions(
     are collected rather than skipped silently, because generating the document from a
     partial environment produces a partial *legal disclosure* — the exact failure this tool
     exists to prevent. The caller decides whether that is fatal; see --allow-missing.
+    A name in :data:`REPLACED_DISTRIBUTIONS` that is not installed resolves to its
+    replacement instead, which is then reported missing if it is absent too.
 
     Note that this is the pip closure, which is a superset of what PyInstaller freezes:
     a declared dependency nothing imports resolves here but never reaches the bundle.
@@ -230,7 +255,10 @@ def resolve_runtime_distributions(
         try:
             dist = distribution(name)
         except PackageNotFoundError:
-            missing.append(name)
+            if key in REPLACED_DISTRIBUTIONS:
+                queue.append(REPLACED_DISTRIBUTIONS[key])
+            else:
+                missing.append(name)
             continue
         found[dist.metadata["Name"]] = dist
         queue.extend(_requirements_of(dist))
@@ -238,9 +266,20 @@ def resolve_runtime_distributions(
 
 
 def drop_unshipped(dists: dict[str, Distribution]) -> dict[str, Distribution]:
-    """``dists`` without the dev-container-only packages (see :data:`UNSHIPPED_PREFIXES`)."""
-    return {name: dist for name, dist in dists.items()
-            if not name.lower().startswith(UNSHIPPED_PREFIXES)}
+    """``dists`` without the packages that reach no frozen app.
+
+    Those are the dev-container-only packages (see :data:`UNSHIPPED_PREFIXES`) and the
+    ones the spec excludes from the bundle (see :data:`EXCLUDED_FROM_BUNDLE`).
+    """
+    shipped: dict[str, Distribution] = {}
+    for name, dist in dists.items():
+        normalized = name.lower().replace("_", "-")
+        if normalized.startswith(UNSHIPPED_PREFIXES):
+            continue
+        if normalized in EXCLUDED_FROM_BUNDLE:
+            continue
+        shipped[name] = dist
+    return shipped
 
 
 # ── License metadata ──────────────────────────────────────────────────────────
@@ -357,9 +396,10 @@ def ffmpeg_binaries(dists: dict[str, Distribution],
     """The FFmpeg executables and shared libraries that ship, as (owner, path) pairs.
 
     Found by name among the installed distributions' own files, because that is where they
-    come from: imageio-ffmpeg carries the executable, opencv-python vendors a video I/O
-    backend, and PyQt6-Qt6 carries Qt's multimedia backend. ``extra`` covers the copy the
-    build scripts stage into vendor/ before PyInstaller runs, which belongs to no wheel.
+    come from: opencv-python vendors a video I/O backend, and PyQt6-Qt6 carries Qt's
+    multimedia backend. ``extra`` covers the executable: the copy the build scripts stage
+    into vendor/ from imageio-ffmpeg before PyInstaller runs, which belongs to no wheel
+    once copied (imageio-ffmpeg itself is excluded, see :data:`EXCLUDED_FROM_BUNDLE`).
     """
     found: list[tuple[str, Path]] = []
     for name in sorted(dists, key=str.lower):
@@ -569,7 +609,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Project metadata naming the runtime dependency roots.")
     parser.add_argument("--include-unshipped", action="store_true",
                         help="Keep packages that resolve here but ship in no build (the "
-                             "Linux-only CUDA/triton stack); for auditing only.")
+                             "Linux-only CUDA/triton stack, and the packages the spec "
+                             "excludes); for auditing only.")
     parser.add_argument("--allow-missing", action="store_true",
                         help="Proceed even when a declared dependency is not installed. "
                              "Off by default: a partial environment yields a partial "

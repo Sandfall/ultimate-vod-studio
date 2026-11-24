@@ -50,7 +50,7 @@ from typing import IO, TextIO, override
 from PyQt6 import sip
 from PyQt6.QtCore import (QAbstractNativeEventFilter, QByteArray, QCoreApplication, QtMsgType,
                           QMessageLogContext, qInstallMessageHandler,
-                          QT_VERSION_STR, PYQT_VERSION_STR)
+                          PYQT_VERSION_STR, qVersion)
 
 # The log's location and off-switch (CRASH_LOG_ENV, crash_log_path) resolve in runtime_paths,
 # which is Qt-free, so the diagnostics bundler can find the file without importing this module;
@@ -138,7 +138,9 @@ def install(app_label: str) -> None:
     qInstallMessageHandler(_qt_message_handler)
 
     _write(f"=== session start: {app_label} ===")
-    _write(f"python {sys.version.split()[0]}  Qt {QT_VERSION_STR}  PyQt {PYQT_VERSION_STR}")
+    # qVersion() is the Qt runtime that is loaded. QT_VERSION_STR is the Qt that PyQt was
+    # compiled against, which can be older (PyQt6 6.11.0 on the Qt 6.11.2 runtime says 6.11.0).
+    _write(f"python {sys.version.split()[0]}  Qt {qVersion()}  PyQt {PYQT_VERSION_STR}")
     _write(f"platform {sys.platform}  frozen {is_frozen()}  pid {os.getpid()}")
     _write(f"argv {sys.argv!r}")
     _print_stderr(f"crash log: {path}")

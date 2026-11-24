@@ -64,8 +64,13 @@ from vodparse.gui.export_root import export_root  # noqa: E402
 from vodparse.gui.settings import (  # noqa: E402
     FONT_SCALE_DEFAULT, SETTING_FONT_SCALE,
     SETTING_UPLOAD_DESC_TEMPLATE, SETTING_UPLOAD_TITLE_TEMPLATE,
+    # The main app's export title limit, not this window's own SETTING_TITLE_CHAR_LIMIT:
+    SETTING_TITLE_CHAR_LIMIT as SETTING_EXPORT_TITLE_CHAR_LIMIT,
+    TITLE_CHAR_LIMIT_DEFAULT as EXPORT_TITLE_CHAR_LIMIT_DEFAULT,
 )
+from vodparse.export import retitled_for_tournament, write_csv  # noqa: E402  (the export side's CSV)
 from vodparse.ffmpeg_runtime import NO_CONSOLE_WINDOW, ffmpeg_binary  # noqa: E402
+from vodparse.text_utils import parse_timestamp  # noqa: E402
 from vodparse.titles import abbreviate_round  # noqa: E402
 
 # --- theme-aware colors ------------------------------------------------------
@@ -90,10 +95,17 @@ SETTING_TITLE_CHAR_LIMIT = "upload/title_char_limit"
 SETTING_STAY_ON_TOP = "upload/stay_on_top"  # default True; handy while dragging into the browser
 SETTING_COPY_ON_LEFT = "upload/copy_on_left"  # Copy buttons left of the fields; default False (right)
 SETTING_GEOMETRY = "upload/geometry"  # window size+position; absent → default to the left edge
+SETTING_THUMBNAIL_DELAY = "upload/thumbnail_delay_sec"  # see DEFAULT_THUMBNAIL_DELAY_SEC
 
 # Opening size before the user has resized the window (SETTING_GEOMETRY overrides it). Named
 # because "Reset window layouts" restores it too, so the two must not drift apart.
 DEFAULT_WINDOW_SIZE = (560, 640)
+
+# The window is a narrow tool meant to sit beside the browser it drags clips into, so a
+# remembered size wider than this share of its screen's usable width (e.g. zoomed once to
+# fill an external display, which then came back at 3440x1410 every time) is not restored:
+# the window reopens at DEFAULT_WINDOW_SIZE instead, where it was.
+MAX_RESTORED_SCREEN_WIDTH_FRACTION = 0.5
 
 
 def forget_saved_geometry(settings: QSettings) -> None:
@@ -143,6 +155,13 @@ DEFAULT_DESC_TEMPLATE = (
 # CSVs from before the tournament column existed.
 DEFAULT_TITLE_TEMPLATE = "{tournament} - {round} - {p1} vs {p2}"
 DEFAULT_TITLE_CHAR_LIMIT = 100  # YouTube's title cap; matches titles.fit_title's default
+
+# The thumbnail is the frame this many seconds after the clip's first game starts (the CSV's
+# first_game_offset), past the lead-in, which on many streams shows the player cams. A CSV
+# from before that column counts from the clip's own start instead. A clip that ends before
+# that time gets its first frame. Editable in Settings.
+DEFAULT_THUMBNAIL_DELAY_SEC = 5
+MAX_THUMBNAIL_DELAY_SEC = 600
 
 # Under-title note shown when render_fitted_title had to act. "too_long" is the only warning
 # (the title still exceeds the limit); the others just explain why the title differs from the
@@ -300,17 +319,25 @@ def render_fitted_title(template: str, row: dict[str, str],
     return full, "too_long"
 
 
-def _thumbnail(clip_path: Path) -> QPixmap | None:
-    """A still ~1s into the clip via the ffmpeg binary, as a QPixmap. None on any failure:
-    the caller falls back to a generic icon. The drag never depends on this; it always carries
-    the real file path."""
+def thumbnail_time_sec(row: dict[str, str], delay_sec: float) -> float:
+    """Where in the clip file the thumbnail is taken: `delay_sec` after its first game starts
+    (the CSV's first_game_offset), or after the file's start when the CSV predates that
+    column."""
+    first_game = parse_timestamp(row.get("first_game_offset", "")) or 0.0
+    return first_game + delay_sec
+
+
+def _thumbnail(clip_path: Path, at_sec: float) -> QPixmap | None:
+    """The still `at_sec` into the clip via the ffmpeg binary, as a QPixmap. None on any
+    failure (a time past the clip's end included): the caller falls back to a generic icon.
+    The drag never depends on this; it always carries the real file path."""
     # A unique temp file per call, so two assistant instances can't clobber each other's thumbnail.
     with tempfile.NamedTemporaryFile(suffix=".jpg", prefix="upload_assistant_thumb_",
                                      delete=False) as f:
         out = Path(f.name)
     try:
         subprocess.run(
-            [ffmpeg_binary(), "-y", "-ss", "1", "-i", str(clip_path),
+            [ffmpeg_binary(), "-y", "-ss", f"{at_sec:.3f}", "-i", str(clip_path),
              "-frames:v", "1", "-vf", "scale=320:-1", str(out)],
             check=True, capture_output=True, timeout=15,
             creationflags=NO_CONSOLE_WINDOW,  # no console flash per thumbnail on Windows
@@ -460,8 +487,8 @@ class TitleEdit(QPlainTextEdit):
 
 
 class UploadSettingsDialog(QDialog):
-    """Edits and persists the title template, title character limit, and description template
-    (all three via QSettings)."""
+    """Edits and persists the title template, title character limit, description template
+    and thumbnail delay (all four via QSettings)."""
 
     def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -480,6 +507,16 @@ class UploadSettingsDialog(QDialog):
         title_limit_row.addWidget(QLabel("Title character limit"))
         title_limit_row.addWidget(self._title_limit)
         title_limit_row.addStretch(1)
+
+        self._thumbnail_delay = QSpinBox()
+        self._thumbnail_delay.setRange(0, MAX_THUMBNAIL_DELAY_SEC)
+        self._thumbnail_delay.setSuffix(" s after the first game starts")
+        self._thumbnail_delay.setValue(
+            settings.value(SETTING_THUMBNAIL_DELAY, DEFAULT_THUMBNAIL_DELAY_SEC, type=int))
+        thumbnail_row = QHBoxLayout()
+        thumbnail_row.addWidget(QLabel("Thumbnail"))
+        thumbnail_row.addWidget(self._thumbnail_delay)
+        thumbnail_row.addStretch(1)
 
         self._desc_edit = QPlainTextEdit()
         self._desc_edit.setPlainText(
@@ -504,20 +541,23 @@ class UploadSettingsDialog(QDialog):
         layout.addWidget(QLabel("Title template"))
         layout.addWidget(self._title_template)
         layout.addLayout(title_limit_row)
+        layout.addLayout(thumbnail_row)
         layout.addWidget(QLabel("Description template"))
         layout.addWidget(self._desc_edit)
         layout.addWidget(placeholders)
         layout.addWidget(buttons)
 
     def _reset_to_defaults(self) -> None:
-        """Restore all three fields to their built-in defaults (does not persist until OK)."""
+        """Restore all four fields to their built-in defaults (does not persist until OK)."""
         self._title_template.setText(DEFAULT_TITLE_TEMPLATE)
         self._title_limit.setValue(DEFAULT_TITLE_CHAR_LIMIT)
+        self._thumbnail_delay.setValue(DEFAULT_THUMBNAIL_DELAY_SEC)
         self._desc_edit.setPlainText(DEFAULT_DESC_TEMPLATE)
 
     def accept(self) -> None:
         self._settings.setValue(SETTING_TITLE_TEMPLATE, self._title_template.text())
         self._settings.setValue(SETTING_TITLE_CHAR_LIMIT, self._title_limit.value())
+        self._settings.setValue(SETTING_THUMBNAIL_DELAY, self._thumbnail_delay.value())
         self._settings.setValue(SETTING_DESC_TEMPLATE, self._desc_edit.toPlainText())
         super().accept()
 
@@ -553,10 +593,31 @@ class UploadAssistant(QWidget):
 
     def _restore_geometry(self) -> None:
         """Reopen where the user last left the window; first run defaults to the left edge so the
-        tool sits beside the browser it drags into. Restore last so it overrides the initial size."""
+        tool sits beside the browser it drags into. Restore last so it overrides the initial size.
+        A remembered maximized/full-screen state or an oversized window (see
+        MAX_RESTORED_SCREEN_WIDTH_FRACTION) reopens at the default size, in the remembered
+        spot: only the size was the problem, and the spot (beside the browser, say) was
+        chosen on purpose."""
         saved = self._settings.value(SETTING_GEOMETRY, QByteArray(), type=QByteArray)
         if saved.isEmpty() or not self.restoreGeometry(saved):
             self._move_to_default_position()
+            return
+        if self._restored_too_large():
+            self.setWindowState(Qt.WindowState.WindowNoState)
+            self.resize(*DEFAULT_WINDOW_SIZE)
+
+    def _restored_too_large(self) -> bool:
+        """Whether the just-restored geometry is too big for this narrow tool: maximized, full
+        screen, or wider than MAX_RESTORED_SCREEN_WIDTH_FRACTION of its screen's usable width.
+        The default width always fits, so a small screen never caps below it."""
+        if self.isMaximized() or self.isFullScreen():
+            return True
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return False
+        usable_width = screen.availableGeometry().width()
+        max_width = max(DEFAULT_WINDOW_SIZE[0], usable_width * MAX_RESTORED_SCREEN_WIDTH_FRACTION)
+        return self.width() > max_width
 
     def _move_to_default_position(self) -> None:
         """Park the window against the left edge of its screen, vertically centered: where it
@@ -699,24 +760,76 @@ class UploadAssistant(QWidget):
         inside an old export folder it just deleted, and reload it onto the fresh export."""
         return self._csv_path
 
-    def load_csv(self, csv_path: Path) -> None:
-        try:
-            with csv_path.open(newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-                fields = list(reader.fieldnames or [])
-        except OSError as exc:
-            QMessageBox.warning(self, "Could not open CSV", str(exc))
-            return
-        if not rows:
-            QMessageBox.warning(self, "Empty CSV", f"{csv_path.name} has no clips.")
-            return
+    @staticmethod
+    def _read_csv(csv_path: Path) -> tuple[list[dict[str, str]], list[str]]:
+        """The rows of the export CSV at `csv_path` and its header, in file order. Raises
+        OSError when the file can't be read. A row with fewer cells than the header (a
+        hand-edited CSV, or a tool that drops trailing empty cells) reads its missing cells
+        as empty, the same as an empty cell; DictReader would otherwise give None."""
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, restval="")
+            rows = list(reader)
+            fields = list(reader.fieldnames or [])
+        return rows, fields
+
+    def _take_rows(self, csv_path: Path, rows: list[dict[str, str]], fields: list[str]) -> None:
+        """Make `rows` (read from `csv_path`, header `fields`) the loaded CSV, starting on
+        the first clip."""
         self._rows = rows
         self._csv_dir = csv_path.parent
         self._csv_path = csv_path
         self._csv_fields = fields  # original column order, kept for save-back rewrites
         self._index = 0
         self._show_clip()
+
+    def _clear(self) -> None:
+        """Back to the empty state: nothing loaded, nothing to save back to."""
+        self._rows = []
+        self._csv_dir = None
+        self._csv_path = None
+        self._csv_fields = []
+        self._index = 0
+        self._show_clip()
+
+    def load_csv(self, csv_path: Path) -> None:
+        try:
+            rows, fields = self._read_csv(csv_path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Couldn't open CSV", str(exc))
+            return
+        if not rows:
+            QMessageBox.warning(self, "Empty CSV", f"{csv_path.name} has no clips.")
+            return
+        self._take_rows(csv_path, rows, fields)
+
+    def reload_csv(self) -> None:
+        """Re-read the loaded CSV after something else rewrote it: an export that added
+        another VOD's clips to a shared tournament CSV, or replaced this VOD's. The rows in
+        memory would otherwise be stale, and the next save (_save_csv rewrites the whole
+        file) would write them back over the new CSV, dropping the newly exported rows.
+        Stays on the same clip when its filename is still listed, else starts over at the
+        first. A CSV that is gone or lists no clips any more empties the assistant, with
+        no dialog: this runs from the main window, which may be reloading a closed one,
+        and keeping the old rows would only put them back on the next save. A no-op when
+        nothing is loaded."""
+        if self._csv_path is None:
+            return
+        current_filename = self._rows[self._index].get("filename") if self._rows else None
+        try:
+            rows, fields = self._read_csv(self._csv_path)
+        except OSError:
+            rows, fields = [], []
+        if not rows:
+            self._clear()
+            return
+        self._take_rows(self._csv_path, rows, fields)   # back on the first clip
+        if not current_filename:
+            return
+        for index, row in enumerate(self._rows):
+            if row.get("filename") == current_filename:
+                self._index = index
+                self._show_clip()
+                break
 
     def _show_clip(self) -> None:
         """Render the current clip (or the empty state when nothing is loaded)."""
@@ -762,7 +875,15 @@ class UploadAssistant(QWidget):
         clip_path = self._csv_dir / row.get("filename", "")
         if row.get("filename") and clip_path.exists():
             self._warning.setText("")
-            self._thumb.set_clip(clip_path, _thumbnail(clip_path) or self._fallback_icon())
+            delay_sec = self._settings.value(
+                SETTING_THUMBNAIL_DELAY, DEFAULT_THUMBNAIL_DELAY_SEC, type=int)
+            thumbnail_sec = thumbnail_time_sec(row, delay_sec)
+            thumbnail = _thumbnail(clip_path, thumbnail_sec)
+            if thumbnail is None and thumbnail_sec > 0:
+                # A clip that ends before that time (a short stub set) has no frame there:
+                # its first frame still beats the generic file icon.
+                thumbnail = _thumbnail(clip_path, 0.0)
+            self._thumb.set_clip(clip_path, thumbnail or self._fallback_icon())
             self._caption.setText("Drag the clip onto the video upload screen")
         else:
             self._warning.setText(f"Clip file missing: {row.get('filename', '(no filename)')}")
@@ -912,29 +1033,33 @@ class UploadAssistant(QWidget):
         self._apply_tournament_name(dialog.name())
 
     def _apply_tournament_name(self, name: str) -> None:
-        """Set the tournament column on every loaded row, persist the CSV, and re-render the
-        current clip so the title/description show the new name."""
+        """Set the tournament column on every loaded row, and rename it in the title column
+        export wrote (so the CSV matches the assistant for anyone reading it elsewhere; see
+        vodparse.export.retitled_for_tournament), persist the CSV, and re-render the current
+        clip so the title/description show the new name."""
+        export_limit = self._settings.value(SETTING_EXPORT_TITLE_CHAR_LIMIT,
+                                            EXPORT_TITLE_CHAR_LIMIT_DEFAULT, type=int)
         for row in self._rows:
+            if "title" in row:
+                row["title"] = retitled_for_tournament(row, name, export_limit)
             row["tournament"] = name
         self._save_csv()
         self._show_clip()
 
     def _save_csv(self) -> None:
         """Write the loaded rows back to the CSV they came from, keeping the original column
-        order (plus a tournament column appended for CSVs from before it existed)."""
+        order (plus a tournament column appended for CSVs from before it existed). The
+        write is atomic (vodparse.export.write_csv: a sibling temp file replaced over the
+        target): the file may hold a whole tournament's VODs, and a crash mid-write must
+        not leave it truncated."""
         assert self._csv_path is not None
         fields = list(self._csv_fields)
         if "tournament" not in fields:
             fields.append("tournament")
         try:
-            with self._csv_path.open("w", newline="", encoding="utf-8") as f:
-                # extrasaction="ignore" tolerates the None key DictReader adds when a row had
-                # more values than the header; never written back, same as it read.
-                writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(self._rows)
+            write_csv(self._rows, self._csv_path, fieldnames=fields)
         except OSError as exc:
-            QMessageBox.warning(self, "Could not save CSV", str(exc))
+            QMessageBox.warning(self, "Couldn't save CSV", str(exc))
 
 
 

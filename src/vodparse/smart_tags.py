@@ -62,16 +62,19 @@ The ranking is printed and persisted to json_output/<stem>/smart_tags_report.jso
 
 import contextlib
 import io
+import json
 import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from itertools import product
+from pathlib import Path
 from statistics import fmean, median, pvariance
 from typing import cast
 
 from vodparse.bbox import bbox_center_y
+from vodparse.games import DEFAULT_MAX_GAME_COUNT
 from vodparse.grouping import group_into_sets, is_impostor_set, overlay_fell_back_to_ingame
 from vodparse.overlay_filter import find_persistent_graphics
 from vodparse.schema import Match, SetGroup, TagEntry
@@ -317,13 +320,13 @@ def score_tag_y_variance(run: SweepRun, ctx: SweepContext) -> float:
 # "neighboring-set tag similarity" criterion is one more entry here).
 DEFAULT_SCORERS: tuple[Scorer, ...] = (
     Scorer("impostor_games",
-           "games in sets whose confirmed in-game nameplates span 3+ player pairs",
+           "games in sets whose confirmed ingame nameplates span 3+ player pairs",
            score_impostor_games),
     Scorer("single_games",
            "sets containing a single game (players matching no neighbour)",
            score_singleton_sets),
     Scorer("ingame_fallbacks",
-           "matches with no voted overlay tag, falling back to in-game nameplates",
+           "matches with no voted overlay tag, falling back to ingame nameplates",
            score_ingame_fallback_matches),
     Scorer("half_reads",
            "matches whose voted overlay tags resolved one position but not the other",
@@ -451,7 +454,7 @@ def promote_at_bottom_on_heavy_fallback(runs: list[SweepRun]) -> list[SweepRun]:
     return _promote_to_front(
         runs, candidate,
         f"{fraction:.0%} of the scorer winner's ({winner.combo.label()}) sets grouped via "
-        "the in-game fallback: promoted the best --overlay-at-bottom run instead")
+        "the ingame fallback: promoted the best --overlay-at-bottom run instead")
 
 
 def demote_at_bottom_on_light_fallback(runs: list[SweepRun]) -> list[SweepRun]:
@@ -495,7 +498,7 @@ def demote_at_bottom_on_light_fallback(runs: list[SweepRun]) -> list[SweepRun]:
         runs, candidate,
         f"{candidate.combo.label()} read the tournament overlay on {1 - fraction:.0%} of "
         f"its sets and grouped within {max(excess, 0)} singleton set(s) of the "
-        f"{winner.combo.label()} winner, whose tags mirror the in-game nameplates: "
+        f"{winner.combo.label()} winner, whose tags mirror the ingame nameplates: "
         "promoted the overlay run instead")
 
 
@@ -555,7 +558,7 @@ def demote_at_bottom_on_top_structure(runs: list[SweepRun],
         runs, candidate,
         f"the top band shows a valid gamertag pair in {top_structure.pair_frame_frac:.0%} "
         f"of {top_structure.n_ocr_frames} OCR frames: the overlay is at the top, and the "
-        f"{winner.combo.label()} winner's tags mirror the in-game nameplates: promoted "
+        f"{winner.combo.label()} winner's tags mirror the ingame nameplates: promoted "
         f"the best non-at-bottom run ({candidate.combo.label()}) instead")
 
 
@@ -584,7 +587,7 @@ def prefer_overlay_reader_among_non_at_bottom(runs: list[SweepRun]) -> list[Swee
     return _promote_to_front(
         runs, candidate,
         f"{winner.combo.label()} won the scorers but read the overlay on only part of the "
-        f"VOD ({_ingame_fallback_count(winner)} in-game fallbacks); "
+        f"VOD ({_ingame_fallback_count(winner)} ingame fallbacks); "
         f"{candidate.combo.label()} read it more fully "
         f"({_ingame_fallback_count(candidate)}) and grouped within the overlay margin: "
         "preferred the fuller overlay read")
@@ -595,7 +598,8 @@ def run_sweep(raw_matches: list[Match], *, group_by: str, set_characters: str,
               scorers: Sequence[Scorer] = DEFAULT_SCORERS,
               combos: Sequence[FlagCombo] | None = None,
               top_structure: TopBandStructure | None = None,
-              ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT) -> list[SweepRun]:
+              ingame_tag_frac: float = INGAME_TAG_BAND_FRAC_DEFAULT,
+              max_game_count: int = DEFAULT_MAX_GAME_COUNT) -> list[SweepRun]:
     """Enrich `raw_matches` under every flag combination, score each run, and return
     them ranked best-first (rank_runs, then the four post-ranking corrections: see
     promote_at_bottom_on_heavy_fallback, demote_at_bottom_on_light_fallback,
@@ -612,7 +616,8 @@ def run_sweep(raw_matches: list[Match], *, group_by: str, set_characters: str,
     same precomputed-input pattern as enrich_matches' `banners`).
 
     `group_by`/`set_characters` drive the set grouping criterion 1 counts, so it scores
-    the grouping the Review screen will actually show. If the sweep ever gets slow, the
+    the grouping the Review screen will actually show; `max_game_count` is the run's game's
+    highest game count, for that grouping's count fold. If the sweep ever gets slow, the
     isolated fix is caching build_vote_views per (filter_banners, no_overlay_filter)
     4 view variants serve all 16 combos: inside this loop and _voted_tag_y_samples."""
     if combos is None:
@@ -645,7 +650,8 @@ def run_sweep(raw_matches: list[Match], *, group_by: str, set_characters: str,
                                      banners=banners if combo.filter_banners else None,
                                      ingame_tag_frac=ingame_tag_frac)
             sets = group_into_sets(matches, group_by, set_characters=set_characters,
-                                   overlay_at_bottom=combo.overlay_at_bottom)
+                                   overlay_at_bottom=combo.overlay_at_bottom,
+                                   max_game_count=max_game_count)
         run = SweepRun(combo=combo, matches=matches, sets=sets, notes=buffer.getvalue())
         for scorer in scorers:
             run.scores[scorer.name] = scorer.score(run, ctx)
@@ -715,3 +721,29 @@ def build_report(runs: Sequence[SweepRun], scorers: Sequence[Scorer]) -> dict:
         "runs": entries,
         "total_elapsed_sec": round(sum(r.elapsed_sec for r in runs), 3),
     }
+
+
+def report_entry_text(title: str, entry: dict) -> str:
+    """One report entry ("Picked"/"Runner-up") as text for a GUI summary popup: the flag
+    label plus each scorer's value ("-" for the no-tags variance sentinel, stored as null),
+    plus the heavy-fallback promotion reason on a winner the correction moved to the front."""
+    scores = ", ".join(f"{name} {value:g}" if isinstance(value, (int, float)) else f"{name} -"
+                       for name, value in entry["scores"].items())
+    text = f"{title}: {entry['label']}\n{scores}"
+    if entry.get("promotion"):
+        text += f"\n{entry['promotion']}"
+    return text
+
+
+def read_report_summary(report_path: Path) -> str | None:
+    """The winner and runner-up of the sweep report at `report_path`, as the text of a GUI
+    summary popup (see report_entry_text). None when the report is missing or malformed: the
+    popup is informational, so its callers skip it rather than fail."""
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        lines = [report_entry_text("Picked", report["winner"])]
+        if report.get("runner_up"):
+            lines.append(report_entry_text("Runner-up", report["runner_up"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return "\n\n".join(lines)

@@ -1,13 +1,15 @@
 """Persisted app-settings keys and defaults for the desktop GUI (QSettings-backed).
 
 Shared by app.py (MainWindow reads them) and dialogs.py (SettingsDialog and the
-Advanced Extract Options popup edit them). The Review screen's own flag toggles/thresholds
+Advanced Analysis Options popup edit them). The Review screen's own flag toggles/thresholds
 (and their row tints) live in vodparse.gui.review.flags, next to the logic they parameterize;
 its fallback-marker and confirm-suppression keys stay in vodparse.gui.review.model. Qt-free.
 """
 
 from collections.abc import Mapping
 from typing import Any
+
+from vodparse.ocr_engine import FONT_STYLE_NAMES
 
 # OCR cadence choices for the Analyze VOD page (label → seconds). The GUI always runs the pipeline
 # in seek mode, so the chosen value drives both the periodic OCR interval (--ocr-interval) and the
@@ -51,20 +53,19 @@ def lang_display_name(lang_code: str) -> str:
 # Overlay text-engine choices for the Analyze VOD page (label → engine id). The ids
 # ("easyocr"/"doctr") must exactly match the keys of vodparse.ocr_engine.OCR_ENGINE_LABELS, the
 # source of truth for what vodparse.cli.pipeline's --ocr-engine accepts; keep both dicts in sync
-# when adding an engine. docTR ships with the app, but the combo stays robust to an
-# environment without it: it greys the item out when the package isn't importable, and
-# resolve_saved_engine() below keeps a stale saved choice from selecting it.
+# when adding an engine. docTR ships with the app; in an environment without it Stylized
+# stays listed and selectable (marked "not installed"), and whatever needs it stops with
+# ocr_engine.engine_unusable_reason rather than reading with Standard in its place.
 OCR_ENGINE_DEFAULT_GUI = "easyocr"
-OCR_ENGINE_CHOICES = {"Standard": "easyocr", "Stylized": "doctr"}
+OCR_ENGINE_CHOICES = {name: engine for engine, name in FONT_STYLE_NAMES.items()}
 
 
-def resolve_saved_engine(saved: str, doctr_installed: bool) -> str:
-    """The engine the Analyze page's Text-engine combo should preselect: the saved value,
-    unless it is unknown (a settings file from a different version) or it names docTR while
-    the optional package is no longer installed; then the default."""
+def resolve_saved_engine(saved: str) -> str:
+    """The engine a Font style combo should preselect: the saved value, unless it is
+    unknown (a settings file from a different version), then the default. A saved Stylized
+    stays Stylized even when docTR can't run here: what needs it then stops and says why
+    (ocr_engine.engine_unusable_reason), never reading with Standard instead."""
     if saved not in OCR_ENGINE_CHOICES.values():
-        return OCR_ENGINE_DEFAULT_GUI
-    if saved == "doctr" and not doctr_installed:
         return OCR_ENGINE_DEFAULT_GUI
     return saved
 
@@ -89,12 +90,55 @@ SETTING_TITLE_FILENAMES_MATCHES = "export/title_filenames_matches"  # default Fa
 # No chapters-delivery key: the Review screen's button always copies to the clipboard. The old
 # "export/chapters_mode" ("copy" | "save" | "both") is retired and left unread in existing stores.
 SETTING_SHOW_ETA         = "analysis/show_eta"          # default True
+# Which game the VOD is of (a vodparse.games id; default GAME_DEFAULT). Drives the main
+# screen's Game dropdown, which overlay-layout presets the chooser beside it offers, and
+# --game on the pipeline (see vodparse.gui.commands.pipeline_argv).
+SETTING_GAME             = "pipeline/game"
 SETTING_OCR_INTERVAL_SEC = "pipeline/ocr_interval_sec"  # default OCR_INTERVAL_DEFAULT_SEC
-SETTING_GATE_OCR_ON_TIMER = "pipeline/gate_ocr_on_timer"  # default True (OCR speed-up)
-SETTING_OCR_ROI_CACHE     = "pipeline/ocr_roi_cache"      # default True (OCR speed-up)
+SETTING_GATE_OCR_ON_TIMER = "pipeline/gate_ocr_on_timer"  # default GATE_OCR_ON_TIMER_DEFAULT
+SETTING_OCR_ROI_CACHE     = "pipeline/ocr_roi_cache"      # default OCR_ROI_CACHE_DEFAULT
 SETTING_OCR_LANG          = "pipeline/ocr_lang"           # default OCR_LANG_DEFAULT_GUI
 SETTING_OCR_ENGINE        = "pipeline/ocr_engine"         # default OCR_ENGINE_DEFAULT_GUI
 SETTING_INGAME_TAG_BAND_FRAC = "pipeline/ingame_tag_band_frac"  # default INGAME_TAG_BAND_FRAC_DEFAULT (tags.py)
+
+# The two OCR speed-ups (skip OCR on frames without a readable clock; reuse the overlay's text
+# boxes between reads) are on unless the user turns them off. One constant each, read by the
+# main GUI's run and Settings pane and by the VOD Grabber's: the grabber was ported while they
+# were still off by default and kept running without them after the main GUI turned them on.
+GATE_OCR_ON_TIMER_DEFAULT = True
+OCR_ROI_CACHE_DEFAULT = True
+
+
+def band_pct_from_frac(frac: float) -> int:
+    """The in-game nametag band's height as a whole-number percent of frame height, for a
+    Settings spinbox: the stored top-edge fraction 0.92 (bottom 8%) shows as 8, 0.86 as 14.
+    Shared by the main Settings dialog and the vod grabber's, so the mapping has one home."""
+    return round((1.0 - frac) * 100)
+
+
+def band_frac_from_pct(pct: int) -> float:
+    """Inverse of band_pct_from_frac: the spinbox's height-percent back to the stored top-edge
+    fraction the pipeline/CLI take (8 % -> 0.92). Rounded to 2 dp to match --ingame-tag-band-frac."""
+    return round(1.0 - pct / 100, 2)
+
+# The selected custom-overlay-layout preset NAME (see vodparse.overlay_layout). Empty string
+# means "use the built-in overlay-reading heuristics" (vodparse.overlay_layout.AUTO_LAYOUT_NAME
+# is the reserved display name for that choice, never a value stored here). The presets
+# themselves live in their own JSON store (overlay_layouts.json), not in QSettings.
+OVERLAY_LAYOUT_DEFAULT = ""
+
+
+def overlay_layout_setting_key(game_id: str) -> str:
+    """The QSettings key holding the chosen overlay-layout preset for one game (a
+    vodparse.games id).
+
+    One key per game, because a preset belongs to a single game (the chooser only lists that
+    game's presets): switching the Game dropdown to another game and back restores each game's
+    own last choice instead of dropping it. "Reset all preferences" clears the whole settings
+    object, so these keys need no special handling there."""
+    return f"pipeline/overlay_layout/{game_id}"
+
+
 # "Don't show this again" suppression for the warnings that are safe to silence. Every such key
 # lives under the one group so the Settings "Restore confirmation prompts" button can clear them
 # with a single group removal — and any suppressible warning added under it later is covered for
@@ -106,6 +150,23 @@ SETTING_SHOW_DEBUG_MENU  = "ui/show_debug_menu"        # default False (Debug me
 # style is selected. On by default; the Settings → Analysis toggle is for users who already
 # know the difference and don't want the reminder taking up a line.
 SETTING_SHOW_FONT_STYLE_NOTE = "ui/show_font_style_note"  # default True
+# Whether the Analyze page's preview shows its "Tags read on this frame" box (the button
+# beside the zoom buttons toggles it; see gui.layout_preview).
+SETTING_PREVIEW_SHOW_DETAILS = "ui/preview_show_details"  # default PREVIEW_SHOW_DETAILS_DEFAULT
+PREVIEW_SHOW_DETAILS_DEFAULT = False   # hidden until asked for: the boxes on the frame say most of it
+# Whether the Analyze page's Preview box is the layout preview (gui.layout_preview): the
+# chosen video scrubbed, the regions the run reads drawn on the frame, and the clock and
+# player-name searches run as soon as a video is chosen. Off restores the first release's
+# Preview: the video's first frame as a still, nothing detected or read until Analyze VOD
+# runs. Settings → Analysis; app.py and preview.py read it.
+SETTING_SHOW_LAYOUT_PREVIEW = "ui/show_layout_preview"  # default SHOW_LAYOUT_PREVIEW_DEFAULT
+SHOW_LAYOUT_PREVIEW_DEFAULT = True
+# Windows only: whether choosing an .mkv brings up the "convert to MP4" offer. Windows plays
+# an MKV directly, so the offer is off by default there; a user whose MKVs don't show can
+# turn it on (Settings → General). Other platforms always make the offer and never show or
+# read this (see vodparse.ffmpeg_runtime.offers_conversion and mkv_plays_directly).
+SETTING_ASK_CONVERT_MKV = "ui/ask_convert_mkv"  # default ASK_CONVERT_MKV_DEFAULT
+ASK_CONVERT_MKV_DEFAULT = False
 SETTING_SHOW_SMART_TAGS_POPUP = "ui/show_smart_tags_popup"  # default False (winner popup after a --smart-tags run; toggled in the Debug menu)
 SETTING_FONT_SCALE       = "ui/font_scale"             # default 1.0 (whole-UI text size; see FONT_SCALE_CHOICES)
 SETTING_DEFAULT_VOD_DIR  = "paths/default_vod_dir"    # default "" (Choose-video picker opens to last-used)
@@ -135,7 +196,7 @@ SETTING_UPLOAD_TITLE_TEMPLATE = "upload/title_template"
 SETTING_UPLOAD_DESC_TEMPLATE  = "upload/description_template"
 
 # Default extract options flags (extract_matches flag name → default). Their last-used values are
-# remembered in QSettings under "extract/opt_<key>" so the Advanced Extract Options popup opens pre-filled.
+# remembered in QSettings under "extract/opt_<key>" so the Advanced Analysis Options popup opens pre-filled.
 # smart_tags is the Smart/Manual tag-reading choice: Smart runs extract_matches --smart-tags,
 # which sweeps every combination of the four tag flags below and keeps the best result; they
 # are inert (greyed out in the popup) while it's selected. Smart is the default: it needs no
@@ -148,15 +209,23 @@ EXTRACT_OPT_DEFAULTS = {
     "no_overlay_filter": False,
     "debug": True,
 }
-# --set-characters lives in the same Advanced Extract Options popup but is a string (not a bool), so it's tracked
+# --set-characters lives in the same Advanced Analysis Options popup but is a string (not a bool), so it's tracked
 # separately from EXTRACT_OPT_DEFAULTS; remembered under "extract/opt_set_characters".
 SET_CHARACTERS_DEFAULT = "join"
+# "Export as" (the extract_matches --mode: whole sets or individual games) lives in the same
+# popup and is likewise a string tracked separately; remembered under "extract/opt_export_mode".
+# Sets mirrors extract_matches' own default.
+EXPORT_MODE_DEFAULT = "tournament_set"
 
 # The four tag-reading flag keys (a subset of EXTRACT_OPT_DEFAULTS above), and the full set of
 # keys the Smart/Manual tag-reading control edits; those four plus the smart_tags radio. Order
 # matches how _extract_flags historically emitted the CLI flags, so tag_reading_flags is stable.
 TAG_FLAG_KEYS = ("filter_banners", "overlay_at_bottom", "overlay_stacked", "no_overlay_filter")
 TAG_OPTION_KEYS = ("smart_tags", *TAG_FLAG_KEYS)
+
+# extract_matches' Smart tag reading: it sweeps the four flags itself. The one spelling every
+# GUI uses, both to send it and to recognise it in an argv (the summary popup keys on it).
+SMART_TAGS_FLAG = "--smart-tags"
 
 # key → extract_matches CLI flag, in TAG_FLAG_KEYS order.
 _TAG_FLAG_CLI = {
@@ -175,7 +244,7 @@ def seed_tag_options(sidecar: Mapping[str, Any] | None, global_opts: dict) -> di
     exists; the radio from its ``smart_tags``, the toggles from its resolved ``flags``:
     so a smart winner pre-fills Manual with the flags it chose, ready to tweak just one.
     For a pre-sidecar VOD (``sidecar is None``) it falls back to the current global extract
-    opts: the best available record, exactly what the Advanced Extract Options popup would
+    opts: the best available record, exactly what the Advanced Analysis Options popup would
     show, and it self-heals to the sidecar on the first re-read."""
     if sidecar is not None:
         return {"smart_tags": bool(sidecar["smart_tags"]),
@@ -191,7 +260,7 @@ def tag_reading_flags(opts: dict) -> list[str]:
     ``--debug`` preference is deliberately not handled here; the caller appends it, since it's
     a diagnostic, not a tag-reading choice."""
     if opts.get("smart_tags"):
-        return ["--smart-tags"]
+        return [SMART_TAGS_FLAG]
     return [flag for key, flag in _TAG_FLAG_CLI.items() if opts.get(key)]
 
 

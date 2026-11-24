@@ -2,6 +2,7 @@
 
 import csv
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +50,13 @@ CSV_FIELDS = [
     # downstream tools (e.g. the upload assistant's {tournament} placeholder) can rebuild
     # titles from parts without re-asking for it.
     "tournament",
+    # The VOD (its stem) the clip was cut from. One tournament can span several VODs that
+    # share this CSV (see merge_vod_rows), and start_time/end_time are positions inside it.
+    "vod",
+    # Where the clip's first game starts inside the clip file (M:SS from the file's start;
+    # empty when unknown, as for clips exported before the column existed). The upload
+    # assistant takes its thumbnail a few seconds after it, past the lead-in.
+    "first_game_offset",
 ]
 
 
@@ -83,7 +91,7 @@ def _safe_name(text: str) -> str:
     without splitting a multi-byte character. Windows reserved device names (NUL, COM1, etc.)
     are prefixed with "_" to defuse them. Returns "" when nothing usable remains: i.e. the
     text held no alphanumeric character in *any* script (so a fully non-Latin title like
-    "スマブラ大会" is kept, not discarded): letting callers apply their own fallback."""
+    "格闘ゲーム大会" is kept, not discarded): letting callers apply their own fallback."""
     name = _FILENAME_BAD_CHARS.sub("-", text)
     name = re.sub(r"\s+", " ", name).strip().strip(".")
     if not any(ch.isalnum() for ch in name):
@@ -170,9 +178,11 @@ def _title_filename(title: str, fallback: str, used: set[str], clip_dir: Path,
     export folder is already named after the tournament, so repeating it in every clip
     only eats the Windows path budget), sanitized via _safe_name, truncated so the
     full path under `clip_dir` stays Windows-openable (see _MAX_CLIP_PATH), with a
-    " (2)"-style suffix for a duplicate title within the same export so clips can't
-    overwrite each other. `fallback` (the numbered default, no extension) covers an
-    empty-after-sanitizing title."""
+    " (2)"-style suffix when the name is already in `used` (an earlier clip of this
+    export, or another VOD's clip in the same folder; see other_vod_filenames) so clips
+    can't overwrite each other. `used` holds lower-cased names without the extension.
+    `fallback` (the numbered default, no extension) covers an empty-after-sanitizing
+    title."""
     # build_title composes "{tournament} - {round} - {matchup}" and fit_title never drops
     # the tournament, so the prefix is exact; removeprefix is a no-op when it isn't there.
     if tournament_name:
@@ -203,14 +213,17 @@ class ClipMeta:
     characters: list | None = None
     tournament_sponsors: list | None = None
     grouping_tags: list | None = None
+    # Seconds from the clip file's start to its first game's start (the CSV's
+    # first_game_offset); None when the exporter doesn't know it.
+    first_game_offset_sec: float | None = None
 
 
-def _make_csv_row(meta: ClipMeta, *, tournament_name: str = "",
+def _make_csv_row(meta: ClipMeta, *, vod: str = "", tournament_name: str = "",
                   use_sponsors: bool = True, title_limit: int = 100,
                   title_records: list[dict] | None = None) -> dict:
     """Build one clip's CSV row (keys = CSV_FIELDS) from its ClipMeta plus the export-wide
-    knobs. When `title_records` is given, append this row's {row, action, original} title-fit
-    record to it for report_titles."""
+    knobs; `vod` is the stem of the VOD being exported. When `title_records` is given,
+    append this row's {row, action, original} title-fit record to it for report_titles."""
     tags   = meta.ingame_tags or ["unknown", "unknown"]
     p1     = tags[0]
     p2     = tags[1] if len(tags) > 1 else ""
@@ -252,6 +265,9 @@ def _make_csv_row(meta: ClipMeta, *, tournament_name: str = "",
         "end_time":                format_timestamp(meta.end_sec),
         "title":                   title,
         "tournament":              tournament_name,
+        "vod":                     vod,
+        "first_game_offset":       ("" if meta.first_game_offset_sec is None
+                                    else format_timestamp(meta.first_game_offset_sec)),
     }
     if title_records is not None:
         # The full unshortened title, for the report; only meaningful when fit_title acted.
@@ -290,34 +306,228 @@ def build_chapters(data: ReviewedData, use_sponsors: bool) -> str:
     return "".join(line + "\n" for line in lines)
 
 
-def write_csv(rows: list[dict], path: str) -> None:
-    """Write the export rows to `path` as a CSV with the fixed CSV_FIELDS header."""
-    # Plain UTF-8, no BOM: the primary reader of this CSV is our own upload assistant, not
-    # Excel, so round-trip fidelity with the readers below wins over Excel's BOM convenience.
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+def retitled_for_tournament(row: dict[str, str], new_name: str, title_limit: int) -> str:
+    """The `title` column of a CSV `row` (as _make_csv_row wrote it) with its tournament
+    renamed to `new_name`, for the Upload Assistant's Change tournament name.
 
+    Export built the title with fit_title from the row's own columns, but two of its inputs
+    aren't recorded in the CSV: whether sponsors were included, and the title limit then in
+    effect. So the title is rebuilt with the old name both with and without sponsors, at
+    `title_limit` (the export setting now); a match shows how export built it, and the same
+    build with the new name replaces it, shortened as export would. When neither matches (the
+    limit has changed since, or the title was edited by hand), a leading "<old name> - " is
+    swapped for the new name instead, and a title without one is left as it is."""
+    old_name = row.get("tournament", "")
+    title = row.get("title", "")
+    tags = (row.get("player_1_tag", ""), row.get("player_2_tag", ""))
+    characters = {"c1": row.get("player_1_character", ""), "c2": row.get("player_2_character", "")}
+    round_str = row.get("round", "")
+    with_sponsors = (row.get("player_1_sponsor", ""), row.get("player_2_sponsor", ""))
+    for s1, s2 in (with_sponsors, ("", "")):
+        rebuilt, _action = fit_title(*tags, **characters, tournament_name=old_name,
+                                     round_str=round_str, s1=s1, s2=s2, title_limit=title_limit)
+        if rebuilt == title:
+            renamed, _action = fit_title(*tags, **characters, tournament_name=new_name,
+                                         round_str=round_str, s1=s1, s2=s2,
+                                         title_limit=title_limit)
+            return renamed
+    old_prefix = f"{old_name} - "
+    if old_name and title.startswith(old_prefix):
+        rest = title.removeprefix(old_prefix)
+        return " - ".join(part for part in (new_name, rest) if part)   # as build_title joins
+    return title
+
+
+def write_csv(rows: list[dict], path: str | Path,
+              fieldnames: Sequence[str] = CSV_FIELDS) -> None:
+    """Write the export rows to `path` as a CSV with the `fieldnames` header (the fixed
+    CSV_FIELDS unless the caller preserves an existing file's columns, as the Upload
+    Assistant does), in one atomic step: a sibling temp file replaced over the target, so
+    a crash mid-write never leaves a truncated CSV (it may hold other VODs' rows; see
+    merge_vod_rows). Columns missing from a row are written empty: a row read back from a
+    CSV that predates a column. Keys outside `fieldnames` are dropped."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        # Plain UTF-8, no BOM: the primary reader of this CSV is our own upload assistant,
+        # not Excel, so round-trip fidelity with the readers wins over Excel's BOM convenience.
+        with tmp.open("w", newline="", encoding="utf-8") as f:
+            # extrasaction="ignore" tolerates the None key DictReader adds to a read-back
+            # row that had more values than the header.
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def write_csv_or_exit(rows: list[dict], path: str | Path) -> None:
+    """write_csv for the export stages: a CSV that can't be replaced (on Windows, one open
+    in Excel) stops the stage with a clear message instead of a traceback. The clips are
+    cut by then, so the message says so: a second export re-cuts them in place."""
+    try:
+        write_csv(rows, path)
+    except OSError as err:
+        raise SystemExit(f"error: couldn't write {path} ({err}). The clips were cut; close "
+                         "the CSV in Excel or the Upload Assistant and export again.") from err
+
+
+# ── One tournament, several VODs: the shared CSV ───────────────────────────────────
+# A tournament whose stream restarted arrives as several VOD files. export_basename
+# names the export folder and its CSV after the tournament, not the VOD, so every VOD of
+# the tournament exports into the same folder and the same CSV. Each row records its
+# source VOD in the "vod" column, and an export replaces only its own VOD's rows: the
+# Upload Assistant gets the whole tournament in one file, and re-exporting a VOD after
+# fixing its clips (merged, split, retitled, excluded) swaps out exactly that VOD's block.
+#
+# Rows from before the "vod" column existed carry no VOD. They are from a build that
+# overwrote the whole CSV on every export, and the next export into that folder replaces
+# them the same way (the clip files stay on disk; only the rows go). Guessing whose they
+# were is not worth it: nothing may ever delete a file on the strength of a guess.
+
+class ExportCsvFormatError(ValueError):
+    """An existing export CSV parses, but not as one of ours: its header has no "filename"
+    column. A spreadsheet app re-saved it with another delimiter (every row then reads as
+    one giant key), or the header was edited. Such rows can't be matched to clips, and
+    writing them back would turn them into blank rows, so the file is refused instead."""
+
+
+# What reading an existing export CSV can raise: the file vanished or is unreadable
+# (OSError), it was re-saved in a non-UTF-8 encoding (UnicodeDecodeError), it is
+# malformed (csv.Error), or its header is not an export CSV's (ExportCsvFormatError).
+CSV_READ_ERRORS = (OSError, UnicodeDecodeError, csv.Error, ExportCsvFormatError)
+
+# The one column every export CSV has had since the first build: the clip's file name.
+# Its absence from a header means the file is not (any more) an export CSV.
+CSV_REQUIRED_FIELD = "filename"
+
+
+def read_export_csv(path: Path) -> list[dict[str, str]]:
+    """The rows of the export CSV at `path`, or [] when there is none yet or the file is
+    empty. Read as UTF-8, tolerating the BOM a spreadsheet app may add when the user
+    re-saves the file. Raises one of CSV_READ_ERRORS when the file exists but can't be
+    read, including a header without the "filename" column (ExportCsvFormatError)."""
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames  # None for an empty file: nothing to refuse, nothing to keep
+        if header is not None and CSV_REQUIRED_FIELD not in header:
+            raise ExportCsvFormatError(
+                f"its header has no '{CSV_REQUIRED_FIELD}' column; it may have been re-saved "
+                "with a different delimiter")
+        return list(reader)
+
+
+def read_export_csv_or_exit(path: Path) -> list[dict[str, str]]:
+    """read_export_csv for the export stages: an unreadable CSV stops the export with a
+    clear message instead of a traceback. The stages read it before cutting any clip, so
+    the user loses no time, and the file (which may hold other VODs' rows) is never
+    overwritten with this VOD's rows alone."""
+    try:
+        return read_export_csv(path)
+    except CSV_READ_ERRORS as err:
+        raise SystemExit(f"error: can't read the existing {path} ({err}). It may hold other "
+                         "VODs' clips, so it was left untouched and nothing was exported. "
+                         "Move it out of the folder (or re-save it as a comma-separated "
+                         "UTF-8 CSV) and export again.") from err
+
+
+def is_vod_row(row: Mapping[str, str], stem: str) -> bool:
+    """Whether CSV `row` belongs to the VOD named `stem`: its "vod" value is that stem."""
+    return (row.get("vod") or "") == stem
+
+
+def is_unlabeled_row(row: Mapping[str, str]) -> bool:
+    """Whether CSV `row` predates the "vod" column (no VOD recorded): a row an export into
+    this folder replaces, as the build that wrote it would have (see the banner above)."""
+    return not (row.get("vod") or "")
+
+
+def is_other_vod_row(row: Mapping[str, str], stem: str) -> bool:
+    """Whether CSV `row` belongs to a VOD other than `stem`: labeled, and not with that
+    stem. Unlabeled rows are nobody's (see is_unlabeled_row)."""
+    return not is_unlabeled_row(row) and not is_vod_row(row, stem)
+
+
+def merge_vod_rows(existing_rows: list[dict[str, str]], new_rows: list[dict], stem: str
+                   ) -> list[dict]:
+    """The shared CSV's rows after the VOD named `stem` exports `new_rows`: every existing
+    row of that VOD is dropped, and `new_rows` take the place of the first one, so a
+    re-exported VOD keeps its position in the file. A VOD exporting here for the first
+    time is appended at the end. Other VODs' rows are kept as they are, in order; rows
+    from before the "vod" column are dropped (see is_unlabeled_row)."""
+    merged: list[dict] = []
+    new_rows_placed = False
+    for row in existing_rows:
+        if is_other_vod_row(row, stem):
+            merged.append(row)
+        elif is_vod_row(row, stem) and not new_rows_placed:
+            merged.extend(new_rows)
+            new_rows_placed = True
+    if not new_rows_placed:
+        merged.extend(new_rows)
+    return merged
+
+
+def other_vod_clip_counts(rows: list[dict[str, str]], stem: str) -> dict[str, int]:
+    """How many clips each VOD other than `stem` has in the shared CSV `rows`, keyed by
+    VOD stem in the order the VODs first appear. Rows from before the "vod" column are
+    not counted: an export replaces them."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        if is_other_vod_row(row, stem):
+            counts[row["vod"]] = counts.get(row["vod"], 0) + 1
+    return counts
+
+
+def other_vod_filenames(rows: list[dict[str, str]], stem: str) -> frozenset[str]:
+    """The clip filenames that VODs other than `stem` already use in the shared CSV
+    `rows`, lower-cased and without the extension: the form _title_filename's
+    de-duplication set holds. Seeding that set with them keeps this VOD's title-based
+    names off the other VODs' clips: a set split across a stream restart has the same
+    title in both VODs, and the second export would otherwise overwrite the first's clip.
+    This VOD's own old names are left out, so a re-export keeps its filenames; so are the
+    names of rows from before the "vod" column, which the export replaces."""
+    return frozenset(Path(row["filename"]).stem.lower() for row in rows
+                     if row.get("filename") and is_other_vod_row(row, stem))
+
+
+def print_kept_vods(existing_rows: list[dict[str, str]], stem: str) -> None:
+    """Log which other VODs' rows an export kept in the shared CSV, so a multi-VOD
+    tournament's export log says the file covers more than this VOD; and how many rows
+    from before the "vod" column it replaced, so their absence is no surprise."""
+    counts = other_vod_clip_counts(existing_rows, stem)
+    for other_vod, count in counts.items():
+        print(f"         kept {count} clip(s) from {other_vod}")
+    replaced = sum(1 for row in existing_rows if is_unlabeled_row(row))
+    if replaced:
+        print(f"         replaced {replaced} row(s) from an export before the vod column "
+              "(their clip files stay in the folder)")
 
 def export_match_clips(matches: list[Match], video_path: str, stem: str,
                        clip_dir: Path, start_buffer: float, end_buffer: float,
                        tournament_name: str = "", title_limit: int = 100,
                        title_filenames: bool = False,
-                       use_sponsors: bool = True) -> list[dict]:
+                       use_sponsors: bool = True,
+                       taken_names: frozenset[str] = frozenset()) -> list[dict]:
     """Cut one clip per match (buffers applied to each match's markers) and return the CSV rows;
-    also writes the per-clip title-length report into clip_dir. See export_reviewed for the
+    also writes the per-clip title-length report into clip_dir. `taken_names` are filenames
+    other VODs already use in clip_dir (see other_vod_filenames). See export_reviewed for the
     review-screen path that exports from human-corrected absolute boundaries."""
     print(f"\nSaving game clips to {clip_dir}/")
     warn_if_clip_paths_cramped(clip_dir)
     rows = []
     title_records: list[dict] = []
-    used_names: set[str] = set()
+    used_names: set[str] = set(taken_names)
     # Half overlay reads only name a clip on a VOD whose overlay provably reads as full
     # pairs somewhere (see grouping.grouping_tags).
     trust_half_overlay = _overlay_reads_full_pairs(matches)
     for m in matches:
         default_name = f"{stem}_game_{m['match_number']:02d}"
+        start = max(0.0, m["start"]["timestamp_sec"] - start_buffer)
         meta = ClipMeta(f"{default_name}.mp4", m.get("ingame_tags"),
                         m.get("tournament_tags"), m.get("round") or "",
                         m["start"]["timestamp_sec"], m["end"]["timestamp_sec"],
@@ -326,14 +536,15 @@ def export_match_clips(matches: list[Match], video_path: str, stem: str,
                         tournament_sponsors=m.get("tournament_sponsors"),
                         grouping_tags=_grouping_tags("auto", m.get("tournament_tags"),
                                                      m.get("ingame_tags"),
-                                                     trust_half_overlay=trust_half_overlay))
-        row = _make_csv_row(meta, tournament_name=tournament_name, use_sponsors=use_sponsors,
-                            title_limit=title_limit, title_records=title_records)
+                                                     trust_half_overlay=trust_half_overlay),
+                        first_game_offset_sec=m["start"]["timestamp_sec"] - start)
+        row = _make_csv_row(meta, vod=stem, tournament_name=tournament_name,
+                            use_sponsors=use_sponsors, title_limit=title_limit,
+                            title_records=title_records)
         if title_filenames:
             row["filename"] = _title_filename(row["title"], default_name, used_names, clip_dir,
                                               tournament_name=tournament_name)
         clip_filename = row["filename"]
-        start = max(0.0, m["start"]["timestamp_sec"] - start_buffer)
         buf   = 0.0 if m["end"].get("synthesized") else end_buffer
         end   = m["end"]["timestamp_sec"] + buf
         clip_match(video_path, start, end, str(clip_dir / clip_filename))
@@ -347,14 +558,16 @@ def export_set_clips(sets: list[SetGroup], video_path: str, stem: str,
                      clip_dir: Path, start_buffer: float, end_buffer: float,
                      tournament_name: str = "", title_limit: int = 100,
                      title_filenames: bool = True,
-                     use_sponsors: bool = True) -> list[dict]:
+                     use_sponsors: bool = True,
+                     taken_names: frozenset[str] = frozenset()) -> list[dict]:
     """Cut one clip per tournament set (first match's start to last match's end, buffers applied)
-    and return the CSV rows; also writes the per-clip title-length report into clip_dir."""
+    and return the CSV rows; also writes the per-clip title-length report into clip_dir.
+    `taken_names` are filenames other VODs already use in clip_dir (see other_vod_filenames)."""
     print(f"\n{len(sets)} tournament set(s) found. Saving to {clip_dir}/")
     warn_if_clip_paths_cramped(clip_dir)
     rows = []
     title_records: list[dict] = []
-    used_names: set[str] = set()
+    used_names: set[str] = set(taken_names)
     for s in sets:
         first_match = s["matches"][0]
         match_nums  = [m["match_number"] for m in s["matches"]]
@@ -370,6 +583,7 @@ def export_set_clips(sets: list[SetGroup], video_path: str, stem: str,
               f"{s['start_timestamp']:.2f}s → {s['end_timestamp']:.2f}s  "
               f"frames {start_frame}→{end_frame}")
         default_name = f"{stem}_set_{s['set_number']:02d}"
+        start = max(0.0, s["start_timestamp"] - start_buffer)
         meta = ClipMeta(f"{default_name}.mp4", s.get("ingame_tags"),
                         s.get("tournament_tags"), first_match.get("round") or "",
                         s["start_timestamp"], s["end_timestamp"],
@@ -379,14 +593,15 @@ def export_set_clips(sets: list[SetGroup], video_path: str, stem: str,
                         characters=s.get("characters"),
                         tournament_sponsors=s.get("tournament_sponsors")
                                             or first_match.get("tournament_sponsors"),
-                        grouping_tags=s.get("grouping_tags"))
-        row = _make_csv_row(meta, tournament_name=tournament_name, use_sponsors=use_sponsors,
-                            title_limit=title_limit, title_records=title_records)
+                        grouping_tags=s.get("grouping_tags"),
+                        first_game_offset_sec=s["start_timestamp"] - start)
+        row = _make_csv_row(meta, vod=stem, tournament_name=tournament_name,
+                            use_sponsors=use_sponsors, title_limit=title_limit,
+                            title_records=title_records)
         if title_filenames:
             row["filename"] = _title_filename(row["title"], default_name, used_names, clip_dir,
                                               tournament_name=tournament_name)
         clip_filename = row["filename"]
-        start = max(0.0, s["start_timestamp"] - start_buffer)
         buf   = 0.0 if s["matches"][-1]["end"].get("synthesized") else end_buffer
         end   = s["end_timestamp"] + buf
         clip_match(video_path, start, end, str(clip_dir / clip_filename))
@@ -418,22 +633,28 @@ def export_reviewed(data: ReviewedData, clip_dir: Path,
     clip files are named after their titles, and whether sponsors prefix the title tags come from
     the arguments when given, else the GUI-injected "title_char_limit"/"title_filenames"/
     "use_sponsors" in `data`, else the defaults (100; titles for sets, numbered names for
-    matches; sponsors on)."""
-    video           = data["video_path"]
-    stem            = data["stem"]
-    is_set          = data["mode"] != "match"
-    tournament_name = data.get("tournament_name", "")
-    unit            = clip_unit(data)
+    matches; sponsors on).
+
+    The CSV may already hold other VODs of the same tournament: only this VOD's rows are
+    replaced (see merge_vod_rows). Returns this VOD's rows."""
+    video = data["video_path"]
+    stem  = data["stem"]
+    unit  = clip_unit(data)
     title_limit, title_filenames, use_sponsors = _reviewed_title_settings(
         data, title_limit, title_filenames, use_sponsors)
+
+    csv_path = _reviewed_csv_path(data, clip_dir)
+    existing_rows = read_export_csv_or_exit(csv_path)   # before any clip is cut
 
     print(f"\nSaving {len(data['clips'])} {unit} clip(s) to {clip_dir}/")
     warn_if_clip_paths_cramped(clip_dir)
     rows = []
     title_records: list[dict] = []
+    taken_names = other_vod_filenames(existing_rows, stem)
     for clip, row in _reviewed_rows(data, clip_dir, title_limit=title_limit,
                                     title_filenames=title_filenames,
-                                    use_sponsors=use_sponsors, title_records=title_records):
+                                    use_sponsors=use_sponsors, title_records=title_records,
+                                    taken_names=taken_names):
         clip_filename = row["filename"]
         start, end = clip["start_sec"], clip["end_sec"]
         clip_match(video, start, end, str(clip_dir / clip_filename))
@@ -441,10 +662,17 @@ def export_reviewed(data: ReviewedData, clip_dir: Path,
         rows.append(row)
     report_titles(title_records, title_limit, clip_dir)
 
-    csv_path = str(clip_dir / f"{export_basename(tournament_name, stem, is_set)}.csv")
-    write_csv(rows, csv_path)
+    write_csv_or_exit(merge_vod_rows(existing_rows, rows, stem), csv_path)
     print(f"  CSV:   {csv_path}")
+    print_kept_vods(existing_rows, stem)
     return rows
+
+
+def _reviewed_csv_path(data: ReviewedData, clip_dir: Path) -> Path:
+    """The metadata CSV a reviewed export writes into `clip_dir`: named after
+    export_basename (not the folder, which a --folder override may rename)."""
+    is_set = data["mode"] != "match"
+    return clip_dir / f"{export_basename(data.get('tournament_name', ''), data['stem'], is_set)}.csv"
 
 
 def _reviewed_title_settings(data: ReviewedData,
@@ -468,21 +696,33 @@ def _reviewed_title_settings(data: ReviewedData,
     return title_limit, title_filenames, use_sponsors
 
 
+def _first_game_offset(clip: Clip) -> float | None:
+    """Seconds from a reviewed clip's start to its first game's start: the lead-in the
+    reviewer kept before the game. None for a reviewed.json written before first_game_sec
+    existed; 0 when the reviewer cut the clip to start inside the game."""
+    first_game_sec = clip.get("first_game_sec")
+    if first_game_sec is None:
+        return None
+    return max(0.0, first_game_sec - clip["start_sec"])
+
+
 def _reviewed_rows(data: ReviewedData, clip_dir: Path, *,
                    title_limit: int, title_filenames: bool, use_sponsors: bool,
-                   title_records: list[dict]) -> list[tuple[Clip, dict]]:
+                   title_records: list[dict],
+                   taken_names: frozenset[str]) -> list[tuple[Clip, dict]]:
     """Each projection clip paired with its CSV row, final filename included, in export
     order. This is the naming walk shared by export_reviewed and planned_clip_filename:
-    a title-based filename dedups against the *earlier* clips' names (" (2)"-style) and
-    fits clip_dir's path budget, so the pairs must always be built in order, even when
-    only one clip is wanted. Appends to `title_records` (report_titles' input); cuts
-    nothing and touches no files."""
+    a title-based filename dedups (" (2)"-style) against `taken_names` (other VODs' clips
+    in clip_dir; see other_vod_filenames) and the *earlier* clips' names, and fits
+    clip_dir's path budget, so the pairs must always be built in order, even when only
+    one clip is wanted. Appends to `title_records` (report_titles' input); cuts nothing
+    and touches no files."""
     stem            = data["stem"]
     is_set          = data["mode"] != "match"
     tournament_name = data.get("tournament_name", "")
     unit            = clip_unit(data)
     pairs: list[tuple[Clip, dict]] = []
-    used_names: set[str] = set()
+    used_names: set[str] = set(taken_names)
     for clip in data["clips"]:
         default_name = f"{stem}_{unit}_{clip['clip_number']:02d}"
         match_nums = clip.get("match_numbers") or []
@@ -494,9 +734,11 @@ def _reviewed_rows(data: ReviewedData, clip_dir: Path, *,
             matches=",".join(str(n) for n in match_nums) if is_set else "",
             characters=clip.get("characters"),
             tournament_sponsors=clip.get("tournament_sponsors"),
-            grouping_tags=clip.get("grouping_tags"))
-        row = _make_csv_row(meta, tournament_name=tournament_name, use_sponsors=use_sponsors,
-                            title_limit=title_limit, title_records=title_records)
+            grouping_tags=clip.get("grouping_tags"),
+            first_game_offset_sec=_first_game_offset(clip))
+        row = _make_csv_row(meta, vod=stem, tournament_name=tournament_name,
+                            use_sponsors=use_sponsors, title_limit=title_limit,
+                            title_records=title_records)
         if title_filenames:
             row["filename"] = _title_filename(row["title"], default_name, used_names, clip_dir,
                                               tournament_name=tournament_name)
@@ -508,13 +750,22 @@ def planned_clip_filename(data: ReviewedData, clip_number: int, clip_dir: Path) 
     """The filename a full export into `clip_dir` would give clip `clip_number`: the
     save-dialog default for the Review tree's single-clip export, so a one-off file is
     named exactly like its regular-export counterpart. Replays the whole naming walk
-    (duplicate-title suffixes depend on the earlier clips) without cutting anything.
-    Raises ValueError for a clip_number not in the projection (numbering may gap:
-    excluded sets keep their number but are dropped)."""
+    (duplicate-title suffixes depend on the earlier clips and on other VODs' clips listed
+    in clip_dir's CSV) without cutting anything. Rows from before the CSV's "vod" column
+    are left out (the export replaces them), and an unreadable CSV counts as no CSV: this is only the save
+    dialog's suggestion, which the user can still edit. Raises ValueError for a
+    clip_number not in the projection (numbering may gap: excluded sets keep their
+    number but are dropped)."""
     title_limit, title_filenames, use_sponsors = _reviewed_title_settings(data)
+    csv_path = _reviewed_csv_path(data, clip_dir)
+    try:
+        taken_names = other_vod_filenames(read_export_csv(csv_path), data["stem"])
+    except CSV_READ_ERRORS:
+        taken_names = frozenset()
     for clip, row in _reviewed_rows(data, clip_dir, title_limit=title_limit,
                                     title_filenames=title_filenames,
-                                    use_sponsors=use_sponsors, title_records=[]):
+                                    use_sponsors=use_sponsors, title_records=[],
+                                    taken_names=taken_names):
         if clip["clip_number"] == clip_number:
             return row["filename"]
     raise ValueError(f"no clip numbered {clip_number} in the reviewed data "

@@ -8,11 +8,19 @@
 
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 ROOT = Path(SPECPATH) # noqa: F821 - SPECPATH is injected by PyInstaller
+
+# This spec file is executed as a script by PyInstaller, so its own `import vodparse.games`
+# below needs src/ on sys.path too — pathex (set on the Analysis() call further down) only
+# tells PyInstaller's own module scanner where to look, it doesn't affect this file's imports.
+sys.path.insert(0, str(ROOT / "src"))
+
+from vodparse.games import shipped_roster_files, shipped_weight_files
 
 
 def _app_version():
@@ -49,9 +57,15 @@ def _exists(rel):
 _data_specs = [
     # weights/logo.pt (go/game detector) is intentionally NOT bundled: it's no longer
     # distributed and the GUI never loads it (always seek mode).
-    "weights/timer.pt",
-    "weights/character.pt",
-    "weights/m_char.pt",
+    #
+    # The weight list itself comes from the game registry (vodparse.games), not a literal
+    # list here: a future game's weights are one registry edit, not a spec edit too.
+    # _exists() warns and skips any declared file that's absent from this build (e.g. a
+    # game whose weights haven't been trained yet), so a dev freeze still runs.
+    *shipped_weight_files(),
+    # Character rosters the band read snaps names to (vodparse.games.Game.roster), bundled
+    # under assets/rosters/ like the weights under weights/.
+    *shipped_roster_files(),
     "assets/app_icon.png",
     # Licensing payload, all of which must ACCOMPANY the binary rather than merely exist
     # in the repo: GPL-3.0 (PyQt6, the bundled ffmpeg), LGPL (Qt 6, python-bidi, OpenCV's
@@ -83,6 +97,39 @@ binaries = []
 hiddenimports = collect_submodules("vodparse") + [
     "pandas",  # imported lazily in vodparse.debug: name it so the freeze always includes it
 ]
+
+
+# Newer torchvision (0.29 on the 2026-09 Mac build) names its native ops libraries
+# _C_stable / image_stable and loads them from files beside the package. PyInstaller's
+# torchvision hooks still name the old _C / image, so without these hidden imports the
+# frozen app has no torchvision ops and dies on the first pipeline import ("operator
+# torchvision::nms does not exist"). Older torchvision (build_mac.sh's pin to 0.27, the
+# Windows build's 0.21) has no such files, and naming them anyway makes PyInstaller log
+# "ERROR: Hidden import ... not found" (harmless, but it reads like a broken build). So
+# each one is named only when the installed torchvision actually ships it, which keeps
+# the build quiet on the pins and correct on any later bump.
+TORCHVISION_STABLE_OPS_MODULES = ("_C_stable", "image_stable")
+
+
+def _torchvision_native_modules_present(names: Iterable[str]) -> list[str]:
+    """The ``torchvision.<name>`` modules among ``names`` whose native library sits in the
+    installed torchvision package (``_C_stable.so`` / ``.pyd`` / ``.dylib``, whatever this
+    interpreter's extension suffixes are: a ``.pyi`` stub beside it does not count). Looks
+    at the files only: importing torchvision here would load torch into the spec process."""
+    from importlib.machinery import EXTENSION_SUFFIXES
+    from importlib.util import find_spec
+
+    spec = find_spec("torchvision")
+    if spec is None or not spec.submodule_search_locations:
+        return []
+    package_dir = Path(next(iter(spec.submodule_search_locations)))
+    return [
+        f"torchvision.{name}" for name in names
+        if any((package_dir / f"{name}{suffix}").exists() for suffix in EXTENSION_SUFFIXES)
+    ]
+
+
+hiddenimports += _torchvision_native_modules_present(TORCHVISION_STABLE_OPS_MODULES)
 
 # These load submodules / data files dynamically, so static analysis misses them.
 for pkg in ("ultralytics", "easyocr", "doctr"):
@@ -135,7 +182,12 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=[],
     # Trim dev-only weight that would otherwise be pulled in transitively.
-    excludes=["matplotlib.tests", "PyQt6.Qt5", "tkinter"],
+    # polars (~190 MB) is pulled in by ultralytics only for training, benchmarks, plots and
+    # DataFrame export, none of which the app calls. imageio_ffmpeg (~50 MB) is a second copy
+    # of the ffmpeg already bundled as bin/ffmpeg, which vodparse.ffmpeg_runtime finds on
+    # PATH first.
+    excludes=["matplotlib.tests", "PyQt6.Qt5", "tkinter",
+              "polars", "_polars_runtime_32", "imageio_ffmpeg"],
     noarchive=False,
 )
 

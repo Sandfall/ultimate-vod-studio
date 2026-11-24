@@ -99,10 +99,16 @@ def easyocr_user_network_dir() -> str | None:
     return str(workspace_dir() / "easyocr_models" / "user_network")
 
 
-def make_reader(lang: str, gpu: bool = True) -> easyocr.Reader:
+def make_reader(lang: str, gpu: bool = True, quantize: bool = True) -> easyocr.Reader:
     """Construct the EasyOCR reader for `lang`. Imports easyocr lazily so that merely
     importing this module (e.g. from the GUI or a lightweight test) never pulls in
-    torch/easyocr."""
+    torch/easyocr.
+
+    `quantize` is EasyOCR's own default: on CPU it converts the recognizer's LSTM to
+    dynamic int8, which is faster but runs different kernels per platform, so the exact
+    text a CPU read returns can differ between machines. Every product path keeps the
+    default; diagnostic tools pass False to check whether a misread is a quantization
+    artifact."""
     import easyocr
 
     download_note = "" if lang == "en" else " (first use downloads the recognition model, ~60 MB, one time)"
@@ -110,6 +116,7 @@ def make_reader(lang: str, gpu: bool = True) -> easyocr.Reader:
     return easyocr.Reader(
         reader_langs(lang),
         gpu=gpu,
+        quantize=quantize,
         model_storage_directory=easyocr_model_dir(lang),
         user_network_directory=easyocr_user_network_dir(),
     )

@@ -38,9 +38,9 @@ def _compute_label(device: str, *, cuda_installed: bool, has_nvidia_gpu: bool,
     # Install + no GPU is the expected state after a forced test install on a GPU-less box,
     # and confirms the download/activation plumbing itself succeeded.
     if cuda_installed and has_nvidia_gpu:
-        return "CPU (CUDA torch installed but not loaded: analysis still runs on the CPU build)"
+        return "CPU (GPU acceleration is installed but didn't load, so analysis runs on the CPU)"
     if cuda_installed:
-        return "CPU (CUDA torch installed, but no compatible NVIDIA GPU detected)"
+        return "CPU (GPU acceleration is installed, but no compatible NVIDIA GPU was detected)"
     return "CPU"
 
 

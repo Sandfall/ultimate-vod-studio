@@ -13,13 +13,14 @@ from typing import Any
 import cv2
 import numpy as np
 
+from vodparse.games import ULTIMATE_HUD_STRIP_TOP
 from vodparse.schema import CharacterDetection, SideCharacters
 
-# Default top edge of the bottom HUD strip, as a fraction of frame height. In-match damage tiles
-# cluster at 0.86-0.91; 0.72 sits in the empty gap above them and below the mid-screen gameplay
-# band (on-stage fighters / floating glyphs at ~0.60-0.66). Exported so the training-crop harvester
-# filters at the exact line production accepts, instead of keeping its own copy.
-HUD_STRIP_TOP = 0.72
+# Default top edge of the bottom HUD strip, as a fraction of frame height: Ultimate's value,
+# declared on its profile (vodparse.games.ULTIMATE_HUD_STRIP_TOP, with the measurements behind
+# it) and re-exported here so the training-crop harvester filters at the exact line production
+# accepts. Another game's line comes from its own GameWeights.hud_strip_top.
+HUD_STRIP_TOP = ULTIMATE_HUD_STRIP_TOP
 
 # A trailing parenthesized qualifier in a class name marks a variant form of a fighter:
 # the model tells variants apart (separate classes, matching the distinct HUD tiles), but
